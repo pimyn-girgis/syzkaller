@@ -94,8 +94,9 @@ func defaultValues() *Config {
 		Procs:          6,
 		PreserveCorpus: true,
 		Experimental: Experimental{
-			RemoteCover: true,
-			CoverEdges:  true,
+			RemoteCover:      true,
+			CoverEdges:       true,
+			DescriptionsMode: "manual",
 		},
 	}
 }
@@ -171,7 +172,7 @@ func Complete(cfg *Config) error {
 	}
 
 	var err error
-	cfg.Syscalls, err = ParseEnabledSyscalls(cfg.Target, cfg.EnabledSyscalls, cfg.DisabledSyscalls)
+	cfg.Syscalls, err = ParseEnabledSyscalls(cfg.Target, cfg.EnabledSyscalls, cfg.DisabledSyscalls, cfg.Experimental.DescriptionsMode)
 	if err != nil {
 		return err
 	}
@@ -317,7 +318,7 @@ func splitTarget(target string) (string, string, string, error) {
 	return os, vmarch, arch, nil
 }
 
-func ParseEnabledSyscalls(target *prog.Target, enabled, disabled []string) ([]int, error) {
+func ParseEnabledSyscalls(target *prog.Target, enabled, disabled []string, descriptionsMode string) ([]int, error) {
 	syscalls := make(map[int]bool)
 	if len(enabled) != 0 {
 		for _, c := range enabled {
@@ -338,7 +339,9 @@ func ParseEnabledSyscalls(target *prog.Target, enabled, disabled []string) ([]in
 		}
 	}
 	for call := range syscalls {
-		if target.Syscalls[call].Attrs.Disabled {
+		if target.Syscalls[call].Attrs.Disabled ||
+			descriptionsMode == "manual" && target.Syscalls[call].Attrs.Auto ||
+			descriptionsMode == "auto" && !target.Syscalls[call].Attrs.Auto {
 			delete(syscalls, call)
 		}
 	}
