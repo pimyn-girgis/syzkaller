@@ -320,7 +320,7 @@ private:
   }
 
 public:
-  RecordExtractor(const SourceManager *const SM) : SM(SM){};
+  RecordExtractor(const SourceManager *const SM) : SM(SM) {};
   std::string getFieldType(const QualType &fieldType, ASTContext *context, const std::string &fieldName,
                            const std::string &parent = "", bool isSyscallParam = false,
                            const std::string &fieldTypeName = "") {
@@ -840,6 +840,20 @@ public:
   };
 };
 
+class FileOperationsMatcher : public MatchFinder::MatchCallback {
+private:
+public:
+  void virtual run(const MatchFinder::MatchResult &Result) override {
+    ASTContext *context = Result.Context;
+    const auto *cmd = Result.Nodes.getNodeAs<CaseStmt>("cmd");
+    auto charRange =
+        Lexer::getAsCharRange(cmd->getLHS()->getSourceRange(), context->getSourceManager(), context->getLangOpts());
+    std::string cmdString = Lexer::getSourceText(charRange, context->getSourceManager(), context->getLangOpts()).str();
+    const auto &cmdC = cmdString.c_str();
+    printf("ioctl$auto_%s(fd fd, cmd const[%s], arg ptr[in, %s])\n", cmdC, cmdC, cmdC);
+  }
+};
+
 int main(int argc, const char **argv) {
   auto ExpectedParser = clang::tooling::CommonOptionsParser::create(argc, argv, SyzDeclExtractOptionCategory);
   if (!ExpectedParser) {
@@ -856,6 +870,7 @@ int main(int argc, const char **argv) {
 
   NetlinkPolicyMatcher NetlinkPolicyMatcher;
   SyscallMatcher SyscallMatcher;
+  FileOperationsMatcher FileOperationsMatcher;
   MatchFinder Finder;
 
   Finder.addMatcher(functionDecl(isExpandedFromMacro("SYSCALL_DEFINEx"), matchesName("__do_sys_.*")).bind("syscall"),
@@ -876,6 +891,16 @@ int main(int argc, const char **argv) {
                             has(initListExpr().bind("genl_family_init")))
                         .bind("genl_family_decl"),
                     &NetlinkPolicyMatcher);
+
+  const auto FileOpsDecl = recordDecl(hasName("file_operations")).bind("file_operations_record");
+  Finder.addMatcher(
+      varDecl(anyOf(hasType(FileOpsDecl), hasType(arrayType(hasElementType(hasDeclaration(FileOpsDecl))))),
+              isDefinition(),
+              has(initListExpr(forEachDescendant(declRefExpr(to(functionDecl(
+                                   forEachDescendant(switchStmt(forEachSwitchCase(caseStmt().bind("cmd")))))))))
+                      .bind("init")))
+          .bind("file_operations"),
+      &FileOperationsMatcher);
 
   return Tool.run(clang::tooling::newFrontendActionFactory(&Finder).get());
 }

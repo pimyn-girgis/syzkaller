@@ -93,6 +93,7 @@ func main() {
 	eh := ast.LoggingHandler
 	for range cmds {
 		out := <-outputs
+		fmt.Println(out.stdout)
 		if out.stderr != "" {
 			tool.Failf("%s", out.stderr)
 		}
@@ -102,6 +103,7 @@ func main() {
 		}
 		parse := ast.Parse([]byte(out.stdout), "", eh)
 		if parse == nil {
+			continue
 			tool.Failf("parsing error")
 		}
 		appendNodes(&nodes, parse.Nodes, syscallNames)
