@@ -104,7 +104,7 @@ First, download the disk image and reproducers (see instructions above).
 
 Then, go to the syzkaller checkout and build the `syz-crush` tool:
 ```
-$ make crush
+$ ./tools/syz-env make crush
 ```
 
 Prepare a config file (let it be `config.json`):
