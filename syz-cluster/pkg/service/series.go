@@ -54,6 +54,13 @@ func (s *SeriesService) getSessionSeries(ctx context.Context, sessionID string,
 }
 
 func (s *SeriesService) UploadSeries(ctx context.Context, series *api.Series) (*api.UploadSeriesResp, error) {
+	// Fast path: don't upload patch bodies for a series we already have.
+	// This is best effort, seriesRepo.Insert() re-checks it atomically.
+	if existing, err := s.seriesRepo.GetByExtID(ctx, series.ExtID); err != nil {
+		return nil, fmt.Errorf("failed to check for an existing series: %w", err)
+	} else if existing != nil {
+		return &api.UploadSeriesResp{Saved: false}, nil
+	}
 	seriesObj := &db.Series{
 		ID:                uuid.NewString(),
 		ExtID:             series.ExtID,
@@ -74,25 +81,24 @@ func (s *SeriesService) UploadSeries(ctx context.Context, series *api.Series) (*
 		}
 		seriesObj.SubjectTags = append(seriesObj.SubjectTags, tag)
 	}
-	err := s.seriesRepo.Insert(ctx, seriesObj, func() ([]*db.Patch, error) {
-		var ret []*db.Patch
-		for _, patch := range series.Patches {
-			// In case of errors, we will waste some space, but let's ignore it for simplicity.
-			// Patches are not super big.
-			uri, err := s.blobStorage.Write(bytes.NewReader(patch.Body),
-				"Series", seriesObj.ID, "Patches", fmt.Sprint(patch.Seq))
-			if err != nil {
-				return nil, fmt.Errorf("failed to upload patch body: %w", err)
-			}
-			ret = append(ret, &db.Patch{
-				Seq:     int64(patch.Seq),
-				Title:   patch.Title,
-				Link:    patch.Link,
-				BodyURI: uri,
-			})
+	// If we fail below, or if a concurrent upload of the same series wins the race,
+	// the already written blobs are left orphaned. Let's ignore it for simplicity,
+	// patches are not super big.
+	patches := make([]*db.Patch, 0, len(series.Patches))
+	for _, patch := range series.Patches {
+		uri, err := s.blobStorage.Write(bytes.NewReader(patch.Body),
+			"Series", seriesObj.ID, "Patches", fmt.Sprint(patch.Seq))
+		if err != nil {
+			return nil, fmt.Errorf("failed to upload patch body: %w", err)
 		}
-		return ret, nil
-	})
+		patches = append(patches, &db.Patch{
+			Seq:     int64(patch.Seq),
+			Title:   patch.Title,
+			Link:    patch.Link,
+			BodyURI: uri,
+		})
+	}
+	err := s.seriesRepo.Insert(ctx, seriesObj, patches)
 	if err != nil {
 		if errors.Is(err, db.ErrSeriesExists) {
 			return &api.UploadSeriesResp{Saved: false}, nil
