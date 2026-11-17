@@ -110,6 +110,9 @@ const (
 	// LightweightModel is a low-overhead model for deterministic extraction,
 	// formatting, and context compression.
 	LightweightModel ModelCategory = "lightweight"
+	// LightweightGuardrailedModel is a model category for workflows that can
+	// tolerate standard guardrails, preferring newer models with a fallback.
+	LightweightGuardrailedModel ModelCategory = "lightweight-guardrailed"
 )
 
 // Provider represents an LLM provider (e.g., Gemini, Claude).

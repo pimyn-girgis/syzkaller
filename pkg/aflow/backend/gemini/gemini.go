@@ -85,6 +85,13 @@ func (p *Provider) init(ctx context.Context, cfg Config) error {
 	p.noSafetyFilters = cfg.NoSafetyFilters
 
 	p.models = map[string]*modelInfo{
+		"gemini-4-hydrogen": {
+			Thinking: true,
+			// Gemini 4 Hydrogen does not support MINIMAL thinking.
+			MinThinkingLevel: backend.ThinkingLevelLow,
+			InputTokenLimit:  1048576,
+			OutputTokenLimit: 65536,
+		},
 		"gemini-3.8-flash": {
 			Thinking: true,
 			// Gemini 3.8 Flash does not support MINIMAL thinking.
@@ -176,6 +183,8 @@ func (p *Provider) ResolveModels(category backend.ModelCategory) []string {
 		return []string{"gemini-3.8-flash"}
 	case backend.LightweightModel:
 		return []string{"gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"}
+	case backend.LightweightGuardrailedModel:
+		return []string{"gemini-4-hydrogen", "gemini-3.8-flash"}
 	default:
 		return nil
 	}

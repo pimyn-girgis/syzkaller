@@ -38,6 +38,11 @@ func TestProviderResolveModels(t *testing.T) {
 			want:     []string{"gemini-4-carbon", "gemini-4-argon"},
 		},
 		{
+			name:     "resolves lightweight guardrailed model pool",
+			category: backend.LightweightGuardrailedModel,
+			want:     []string{"gemini-4-hydrogen", "gemini-3.8-flash"},
+		},
+		{
 			name:     "returns nil for unrecognized category",
 			category: "custom-model",
 			want:     nil,

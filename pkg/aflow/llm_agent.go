@@ -110,9 +110,10 @@ const (
 	// Consts to use for LLMAgent.Model.
 	// These are aliases for the backend constants to avoid requiring users
 	// of the aflow package to import the backend package just to specify the model.
-	DeepReasoningModel = backend.DeepReasoningModel
-	CoreModel          = backend.CoreModel
-	LightweightModel   = backend.LightweightModel
+	DeepReasoningModel          = backend.DeepReasoningModel
+	CoreModel                   = backend.CoreModel
+	LightweightModel            = backend.LightweightModel
+	LightweightGuardrailedModel = backend.LightweightGuardrailedModel
 
 	// Default limit for consecutive identical tool calls.
 	defaultLoopDetectionLimit = 3
