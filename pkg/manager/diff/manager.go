@@ -4,6 +4,7 @@
 package diff
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -103,6 +104,7 @@ func Run(ctx context.Context, baseCfg, newCfg *mgrconfig.Config, cfg Config) err
 	diffCtx := &diffContext{
 		cfg:           cfg,
 		doneRepro:     make(chan *manager.ReproResult),
+		focusedCrash:  make(chan struct{}, 1),
 		base:          base,
 		new:           new,
 		store:         cfg.Store,
@@ -144,13 +146,19 @@ type diffContext struct {
 	store *manager.DiffFuzzerStore
 	http  *manager.HTTPServer
 
-	doneRepro   chan *manager.ReproResult
-	base        Kernel
-	new         Kernel
-	patchedOnly chan *Bug
+	doneRepro    chan *manager.ReproResult
+	focusedCrash chan struct{}
+	base         Kernel
+	new          Kernel
+	patchedOnly  chan *Bug
 
 	mu            sync.Mutex
 	reproAttempts map[string]int
+	nextReproID   int
+	activeRepros  map[string]map[int]context.CancelFunc
+	focusInit     sync.Once
+	focusFiles    map[string]struct{}
+	focusSymbols  map[string]struct{}
 }
 
 const (
@@ -161,6 +169,9 @@ const (
 )
 
 func (dc *diffContext) Loop(ctx context.Context) error {
+	if dc.focusedCrash == nil {
+		dc.focusedCrash = make(chan struct{}, 1)
+	}
 	g, groupCtx := errgroup.WithContext(ctx)
 	reproLoop := manager.NewReproLoop(dc, dc.new.Pool().Total()-dc.new.Config().FuzzingVMs, false)
 	if dc.http != nil {
@@ -170,13 +181,26 @@ func (dc *diffContext) Loop(ctx context.Context) error {
 		})
 	}
 
+	triageReady := make(chan struct{})
 	g.Go(func() error {
 		select {
 		case <-groupCtx.Done():
 			return nil
 		case <-dc.waitCorpusTriage(groupCtx, corpusTriageToRepro):
 		case <-dc.cfg.TriageDeadline():
-			log.Logf(0, "timed out waiting for coprus triage")
+			log.Logf(0, "timed out waiting for corpus triage")
+		}
+		close(triageReady)
+		return nil
+	})
+
+	g.Go(func() error {
+		select {
+		case <-groupCtx.Done():
+			return nil
+		case <-triageReady:
+		case <-dc.focusedCrash:
+			log.Logf(0, "focused crash observed, starting bug reproductions early")
 		}
 		log.Logf(0, "starting bug reproductions")
 		reproLoop.Loop(groupCtx)
@@ -189,11 +213,19 @@ func (dc *diffContext) Loop(ctx context.Context) error {
 
 	runner := dc.cfg.runner
 	statTimer := time.NewTicker(5 * time.Minute)
+	triageReadyCh := triageReady
+	unfocusedReady := false
+	var deferredUnfocused []*manager.Crash
 loop:
 	for {
 		select {
 		case <-groupCtx.Done():
 			break loop
+		case <-triageReadyCh:
+			triageReadyCh = nil
+			unfocusedReady = true
+			dc.drainDeferredUnfocused(deferredUnfocused, reproLoop)
+			deferredUnfocused = nil
 		case <-statTimer.C:
 			vals := make(map[string]int)
 			for _, stat := range stat.Collect(stat.All) {
@@ -207,44 +239,86 @@ loop:
 		case ret := <-runner.Results():
 			dc.handleReproResult(groupCtx, ret, reproLoop)
 		case ret := <-dc.doneRepro:
-			// We have finished reproducing a crash from the patched instance.
-			if ret.Repro != nil && ret.Repro.Report != nil {
-				origTitle := ret.Crash.Report.Title
-				if ret.Repro.Report.Title == origTitle {
-					origTitle = "-SAME-"
-				}
-				log.Logf(1, "found repro for %q (orig title: %q, reliability: %2.f), took %.2f minutes",
-					ret.Repro.Report.Title, origTitle, ret.Repro.Reliability, ret.Stats.TotalTime.Minutes())
-
-				dc.store.UpdateStatus(ret.Repro.Report.Title, manager.DiffBugStatusVerifying)
-
-				g.Go(func() error {
-					runner.Run(groupCtx, dc.base, ret.Repro, ret.Crash.FullRepro)
-					return nil
-				})
-			} else {
-				origTitle := ret.Crash.Report.Title
-				log.Logf(1, "failed repro for %q, err=%s", origTitle, ret.Err)
-				dc.store.UpdateStatus(origTitle, manager.DiffBugStatusCompleted)
-			}
-			dc.store.SaveRepro(ret)
+			dc.handleDoneRepro(groupCtx, g, ret)
 		case rep := <-dc.new.Crashes():
-			// A new crash is found on the patched instance.
-			crash := &manager.Crash{Report: rep}
-			ignore := dc.shouldIgnore(crash)
-			need := !ignore && dc.NeedRepro(crash)
-			log.Logf(0, "patched crashed: %v [need repro = %v]",
-				rep.Title, need)
-			dc.store.PatchedCrashed(rep)
-			if need {
-				dc.store.UpdateStatus(rep.Title, manager.DiffBugStatusVerifying)
-				reproLoop.Enqueue(crash)
-			} else if ignore {
-				dc.store.UpdateStatus(rep.Title, manager.DiffBugStatusIgnored)
+			if deferred := dc.handlePatchedCrash(rep, unfocusedReady, reproLoop); deferred != nil {
+				deferredUnfocused = append(deferredUnfocused, deferred)
 			}
 		}
 	}
 	return g.Wait()
+}
+
+func (dc *diffContext) drainDeferredUnfocused(deferred []*manager.Crash, reproLoop *manager.ReproLoop) {
+	for _, crash := range deferred {
+		if dc.NeedRepro(crash) {
+			reproLoop.Enqueue(crash)
+		} else if dc.shouldIgnore(crash) {
+			dc.store.UpdateStatus(crash.Title, manager.DiffBugStatusIgnored)
+		}
+	}
+}
+
+func (dc *diffContext) handleDoneRepro(ctx context.Context, g *errgroup.Group, ret *manager.ReproResult) {
+	// We have finished reproducing a crash from the patched instance.
+	origTitle := ret.Crash.Report.Title
+	if !ret.Crash.FullRepro && (dc.store.EverCrashedBase(origTitle) ||
+		(ret.Repro != nil && ret.Repro.Report != nil && dc.store.EverCrashedBase(ret.Repro.Report.Title))) {
+		log.Logf(0, "discarding repro for %q: base kernel also crashed", origTitle)
+		dc.store.UpdateStatus(origTitle, manager.DiffBugStatusIgnored)
+		if ret.Repro != nil && ret.Repro.Report != nil {
+			dc.store.UpdateStatus(ret.Repro.Report.Title, manager.DiffBugStatusIgnored)
+		}
+	} else if ret.Repro != nil && ret.Repro.Report != nil {
+		if ret.Repro.Report.Title == origTitle {
+			origTitle = "-SAME-"
+		}
+		log.Logf(1, "found repro for %q (orig title: %q, reliability: %2.f), took %.2f minutes",
+			ret.Repro.Report.Title, origTitle, ret.Repro.Reliability, ret.Stats.TotalTime.Minutes())
+
+		dc.store.UpdateStatus(ret.Repro.Report.Title, manager.DiffBugStatusVerifying)
+
+		g.Go(func() error {
+			dc.cfg.runner.Run(ctx, dc.base, ret.Repro, ret.Crash.FullRepro)
+			return nil
+		})
+	} else {
+		log.Logf(1, "failed repro for %q, err=%s", origTitle, ret.Err)
+		dc.store.UpdateStatus(origTitle, manager.DiffBugStatusCompleted)
+	}
+	dc.store.SaveRepro(ret)
+}
+
+func (dc *diffContext) handlePatchedCrash(rep *report.Report, unfocusedReady bool,
+	reproLoop *manager.ReproLoop) *manager.Crash {
+	// A new crash is found on the patched instance.
+	crash := &manager.Crash{
+		Report:  rep,
+		Focused: dc.isFocusedCrash(rep),
+	}
+	ignore := dc.shouldIgnore(crash)
+	need := !ignore && dc.NeedRepro(crash)
+	log.Logf(0, "patched crashed: %v [need repro = %v, focused = %v]",
+		rep.Title, need, crash.Focused)
+	dc.store.PatchedCrashed(rep)
+	if !need {
+		if ignore {
+			dc.store.UpdateStatus(rep.Title, manager.DiffBugStatusIgnored)
+		}
+		return nil
+	}
+	dc.store.UpdateStatus(rep.Title, manager.DiffBugStatusVerifying)
+	if !unfocusedReady && !crash.Focused {
+		return crash
+	}
+	reproLoop.Enqueue(crash)
+	if crash.Focused && dc.new.Config() != nil && dc.new.Config().FuzzingVMs > 0 {
+		select {
+		case dc.focusedCrash <- struct{}{}:
+		default:
+		}
+	}
+	return nil
 }
 
 func (dc *diffContext) handleReproResult(ctx context.Context, ret reproRunnerResult, reproLoop *manager.ReproLoop) {
@@ -278,6 +352,7 @@ func (dc *diffContext) handleReproResult(ctx context.Context, ret reproRunnerRes
 					Output: ret.repro.Prog.Serialize(),
 				},
 				FullRepro: true,
+				Focused:   dc.isFocusedCrash(ret.reproReport),
 			})
 		}
 	} else {
@@ -307,6 +382,7 @@ func (dc *diffContext) ignoreCrash(ctx context.Context, title string) bool {
 
 func (dc *diffContext) reportBaseCrash(ctx context.Context, rep *report.Report) {
 	dc.store.BaseCrashed(rep.Title, rep.Report)
+	dc.cancelActiveRepros(rep.Title)
 	if dc.cfg.BaseCrashes == nil {
 		return
 	}
@@ -433,12 +509,62 @@ func (dc *diffContext) NeedRepro(crash *manager.Crash) bool {
 	return dc.reproAttempts[crash.Title] < maxReproAttempts
 }
 
-func (dc *diffContext) RunRepro(ctx context.Context, crash *manager.Crash) *manager.ReproResult {
+func (dc *diffContext) registerActiveRepro(crash *manager.Crash, cancel context.CancelFunc) int {
 	dc.mu.Lock()
+	defer dc.mu.Unlock()
 	dc.reproAttempts[crash.Title]++
-	dc.mu.Unlock()
+	if !crash.FullRepro && dc.store.EverCrashedBase(crash.Title) {
+		cancel()
+		return 0
+	}
+	dc.nextReproID++
+	id := dc.nextReproID
+	if dc.activeRepros == nil {
+		dc.activeRepros = make(map[string]map[int]context.CancelFunc)
+	}
+	if dc.activeRepros[crash.Title] == nil {
+		dc.activeRepros[crash.Title] = make(map[int]context.CancelFunc)
+	}
+	dc.activeRepros[crash.Title][id] = cancel
+	return id
+}
 
-	res, stats, err := dc.cfg.runRepro(ctx, crash.Output, repro.Environment{
+func (dc *diffContext) unregisterActiveRepro(title string, id int) {
+	if id == 0 {
+		return
+	}
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	if m := dc.activeRepros[title]; m != nil {
+		delete(m, id)
+		if len(m) == 0 {
+			delete(dc.activeRepros, title)
+		}
+	}
+}
+
+func (dc *diffContext) cancelActiveRepros(title string) {
+	dc.mu.Lock()
+	m := dc.activeRepros[title]
+	delete(dc.activeRepros, title)
+	dc.mu.Unlock()
+	if len(m) > 0 {
+		log.Logf(0, "cancelling %d in-flight reproduction(s) for %q: base kernel also crashed", len(m), title)
+		for _, cancel := range m {
+			cancel()
+		}
+	}
+}
+
+func (dc *diffContext) RunRepro(ctx context.Context, crash *manager.Crash) *manager.ReproResult {
+	reproCtx, cancel := context.WithCancel(ctx)
+	reproID := dc.registerActiveRepro(crash, cancel)
+	defer func() {
+		cancel()
+		dc.unregisterActiveRepro(crash.Title, reproID)
+	}()
+
+	res, stats, err := dc.cfg.runRepro(reproCtx, crash.Output, repro.Environment{
 		Config:   dc.new.Config(),
 		Features: dc.new.Features(),
 		Reporter: dc.new.Reporter(),
@@ -467,4 +593,120 @@ func (dc *diffContext) RunRepro(ctx context.Context, crash *manager.Crash) *mana
 
 func (dc *diffContext) ResizeReproPool(size int) {
 	dc.new.Pool().ReserveForRun(size)
+}
+
+func baseSymbolName(name string) string {
+	if idx := strings.IndexByte(name, '.'); idx > 0 {
+		return name[:idx]
+	}
+	return name
+}
+
+func (dc *diffContext) initFocusMatchers() {
+	dc.focusFiles = make(map[string]struct{})
+	dc.focusSymbols = make(map[string]struct{})
+	cfg := dc.new.Config()
+	if cfg == nil {
+		return
+	}
+	for _, area := range cfg.Experimental.FocusAreas {
+		for _, f := range area.Filter.Files {
+			clean := strings.TrimPrefix(f, "./")
+			if clean != "" {
+				dc.focusFiles[clean] = struct{}{}
+			}
+		}
+		for _, fn := range area.Filter.Functions {
+			clean := strings.TrimSuffix(strings.TrimPrefix(fn, "^"), "$")
+			if clean != "" {
+				dc.focusSymbols[baseSymbolName(clean)] = struct{}{}
+			}
+		}
+	}
+}
+
+func (dc *diffContext) isFocusedCrash(rep *report.Report) bool {
+	if rep == nil {
+		return false
+	}
+	dc.focusInit.Do(dc.initFocusMatchers)
+	if len(dc.focusFiles) == 0 && len(dc.focusSymbols) == 0 {
+		return false
+	}
+	if rep.GuiltyFile != "" {
+		if _, ok := dc.focusFiles[rep.GuiltyFile]; ok {
+			return true
+		}
+	}
+	if rep.Frame != "" {
+		if _, ok := dc.focusSymbols[baseSymbolName(rep.Frame)]; ok {
+			return true
+		}
+	}
+	if idx := strings.LastIndex(rep.Title, " in "); idx >= 0 {
+		sym := strings.TrimSpace(rep.Title[idx+4:])
+		if sym != "" {
+			if _, ok := dc.focusSymbols[baseSymbolName(sym)]; ok {
+				return true
+			}
+		}
+	}
+	if len(rep.Report) > 0 {
+		if len(dc.focusFiles) > 0 && reportContainsFile(rep.Report, dc.focusFiles) {
+			return true
+		}
+		if len(dc.focusSymbols) > 0 && reportContainsSymbol(rep.Report, dc.focusSymbols) {
+			return true
+		}
+	}
+	return false
+}
+
+func reportContainsFile(raw []byte, files map[string]struct{}) bool {
+	for i := 0; i+1 < len(raw); i++ {
+		if raw[i] != ':' || raw[i+1] < '0' || raw[i+1] > '9' {
+			continue
+		}
+		start := i
+		for start > 0 && isFilePathByte(raw[start-1]) {
+			start--
+		}
+		if start < i {
+			path := strings.TrimPrefix(string(raw[start:i]), "./")
+			if _, ok := files[path]; ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isFilePathByte(b byte) bool {
+	return isSymbolByte(b) || b == '/' || b == '-'
+}
+
+func reportContainsSymbol(raw []byte, symbols map[string]struct{}) bool {
+	offset := 0
+	for {
+		rel := bytes.Index(raw[offset:], []byte("+0x"))
+		if rel < 0 {
+			return false
+		}
+		pos := offset + rel
+		start := pos
+		for start > 0 && isSymbolByte(raw[start-1]) {
+			start--
+		}
+		if start < pos {
+			sym := baseSymbolName(string(raw[start:pos]))
+			if _, ok := symbols[sym]; ok {
+				return true
+			}
+		}
+		offset = pos + 3
+	}
+}
+
+func isSymbolByte(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '_' || b == '.'
 }

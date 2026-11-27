@@ -135,7 +135,23 @@ func runInner(ctx context.Context, crashLog []byte, env Environment, exec execIn
 		testTimeouts = testTimeouts[2:]
 	}
 	if env.Fast {
-		testTimeouts = []time.Duration{30 * time.Second, 5 * time.Minute}
+		noOutputTimeout := max(2*time.Minute, cfg.Timeouts.NoOutputRunningTime)
+		switch {
+		case crashTitle == "no output/lost connection":
+			testTimeouts = []time.Duration{
+				max(15*time.Second, 3*cfg.Timeouts.Program),
+				noOutputTimeout,
+			}
+		case crashType == crash.MemoryLeak:
+			testTimeouts = []time.Duration{2 * time.Minute}
+		case crashType == crash.Hang:
+			testTimeouts = []time.Duration{noOutputTimeout}
+		default:
+			testTimeouts = []time.Duration{
+				max(15*time.Second, 3*cfg.Timeouts.Program),
+				2 * time.Minute,
+			}
+		}
 	}
 	reproCtx := &reproContext{
 		ctx:           ctx,
@@ -244,13 +260,16 @@ func (ctx *reproContext) repro() (*Result, error) {
 	if res == nil {
 		return nil, nil
 	}
-	res, err = ctx.minimizeProg(res)
-	if err != nil {
-		return nil, err
-	}
 
-	// Try extracting C repro without simplifying options first.
+	// In Fast mode (used by diff fuzzing before base verification), skip minimization and C extraction
+	// until the base kernel confirms the crash is patched-only, after which FullRepro runs with Fast=false.
 	if !ctx.fast {
+		res, err = ctx.minimizeProg(res)
+		if err != nil {
+			return nil, err
+		}
+
+		// Try extracting C repro without simplifying options first.
 		res, err = ctx.extractC(res)
 		if err != nil {
 			return nil, err
@@ -357,8 +376,9 @@ func (ctx *reproContext) extractProg(entries []*prog.LogEntry) (*Result, error) 
 			continue
 		}
 
-		if ctx.fast && i+1 < len(ctx.testTimeouts) {
-			// Bisect only under the biggest timeout.
+		// In fast mode, bisect at the shortest timeout first so deterministic multi-program
+		// crashes reproduce quickly, and only retry bisection at the final timeout if needed.
+		if ctx.fast && i > 0 && i+1 < len(ctx.testTimeouts) {
 			continue
 		}
 
@@ -464,6 +484,16 @@ func (ctx *reproContext) extractProgBisect(entries []*prog.LogEntry, baseDuratio
 // So let's first try to drop unneeded calls.
 func (ctx *reproContext) concatenateProgs(entries []*prog.LogEntry, dur time.Duration) (*Result, error) {
 	ctx.reproLogf(3, "bisect: concatenate %d entries", len(entries))
+	totalCalls := 0
+	for _, entry := range entries {
+		totalCalls += len(entry.P.Calls)
+	}
+	if ctx.fast && len(entries) > 1 && totalCalls <= prog.MaxCalls {
+		res, err := ctx.testConcatenated(entries, dur)
+		if err != nil || res != nil {
+			return res, err
+		}
+	}
 	if len(entries) > 1 {
 		// There's a risk of exceeding prog.MaxCalls, so let's first minimize
 		// all entries separately.
@@ -500,6 +530,10 @@ func (ctx *reproContext) concatenateProgs(entries []*prog.LogEntry, dur time.Dur
 			ctx.reproLogf(2, "minimized %d calls -> %d calls", callsBefore, len(entries[i].P.Calls))
 		}
 	}
+	return ctx.testConcatenated(entries, dur)
+}
+
+func (ctx *reproContext) testConcatenated(entries []*prog.LogEntry, dur time.Duration) (*Result, error) {
 	p := &prog.Prog{
 		Target: entries[0].P.Target,
 	}
@@ -563,6 +597,9 @@ func (ctx *reproContext) minimizeProg(res *Result) (*Result, error) {
 		return ret.Crashed
 	})
 	if testErr != nil {
+		if ctx.ctx.Err() != nil {
+			return nil, ctx.ctx.Err()
+		}
 		return res, nil
 	}
 	return res, nil
@@ -697,7 +734,7 @@ func (ctx *reproContext) getVerdict(callback func() (rep *instance.RunResult, er
 		// If the problem is transient, it will likely go away.
 		// If the problem is permanent, it will just be the same.
 		result, err = callback()
-		if err == nil {
+		if err == nil || ctx.ctx.Err() != nil {
 			break
 		}
 	}
@@ -881,15 +918,16 @@ func (pw *poolWrapper) run(ctx context.Context, duration time.Duration, logf ins
 	var runErr error
 	for {
 		if err := ctx.Err(); err != nil {
-			// Note that we could also propagate ctx down to SetupExecProg() and RunCProg() operations,
-			// but so far it does not seem to be worth the effort.
 			return err
 		}
 		err := pw.pool.Run(ctx, func(ctx context.Context, inst *vm.Instance, updInfo dispatcher.UpdateInfo) {
 			updInfo(func(info *dispatcher.Info) {
 				info.Status = fmt.Sprintf("reproducing (%s, %.1f min)", typ, duration.Minutes())
 			})
-			ret, err := instance.SetupExecProg(inst, pw.cfg, pw.reporter, &instance.OptionalConfig{Logf: logf})
+			ret, err := instance.SetupExecProg(inst, pw.cfg, pw.reporter, &instance.OptionalConfig{
+				Context: ctx,
+				Logf:    logf,
+			})
 			if err != nil {
 				runErr = err
 			} else {

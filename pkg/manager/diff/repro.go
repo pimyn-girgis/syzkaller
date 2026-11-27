@@ -5,8 +5,8 @@ package diff
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -56,61 +56,126 @@ func (rr *reproRunner) Run(ctx context.Context, k Kernel, r *repro.Result, fullR
 	}
 
 	pool := k.Pool()
-	cnt := int(rr.running.Add(1))
-	pool.ReserveForRun(min(cnt, pool.Total()))
+	parallelism := min(needRuns, max(1, pool.Total()-1))
+	reserved := int(rr.running.Add(int64(parallelism)))
+	pool.ReserveForRun(min(reserved, pool.Total()))
 	defer func() {
-		cnt := int(rr.running.Add(-1))
-		pool.ReserveForRun(min(cnt, pool.Total()))
+		reserved := int(rr.running.Add(-int64(parallelism)))
+		pool.ReserveForRun(min(reserved, pool.Total()))
 	}()
 
-	ret := reproRunnerResult{reproReport: r.Report, repro: r, fullRepro: fullRepro}
-	for doneRuns := 0; doneRuns < needRuns; {
-		if ctx.Err() != nil {
-			return
-		}
-		opts := r.Opts
-		opts.Repeat = true
-		if doneRuns%3 != 2 {
-			// Two times out of 3, test with Threaded=true.
-			// The third time we leave it as it was in the reproducer (in case it was important).
-			opts.Threaded = true
-		}
-		var err error
-		var result *instance.RunResult
-		runErr := pool.Run(ctx, func(ctx context.Context, inst *vm.Instance, updInfo dispatcher.UpdateInfo) {
-			var ret *instance.ExecProgInstance
-			ret, err = instance.SetupExecProg(inst, k.Config(), k.Reporter(), nil)
-			if err != nil {
-				return
+	baseDur := max(r.Duration*2, 30*time.Second)
+	if fullRepro {
+		baseDur = max(r.Duration, time.Minute)
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	progData := r.Prog.Serialize()
+	var (
+		mu          sync.Mutex
+		crashReport *report.Report
+		aborted     bool
+	)
+	slots := make(chan int, needRuns)
+	for slot := range needRuns {
+		slots <- slot
+	}
+	close(slots)
+
+	var wg sync.WaitGroup
+	for range parallelism {
+		wg.Go(func() {
+			for slot := range slots {
+				rep, ok := runSlotOnBase(runCtx, k, r, progData, baseDur, slot)
+				if rep != nil {
+					mu.Lock()
+					if crashReport == nil {
+						crashReport = rep
+					}
+					mu.Unlock()
+					cancel()
+					return
+				}
+				if !ok {
+					if ctx.Err() == nil && runCtx.Err() == nil {
+						mu.Lock()
+						aborted = true
+						mu.Unlock()
+						cancel()
+					}
+					return
+				}
 			}
-			result, err = ret.RunSyzProg(r.Prog.Serialize(), instance.RunOptions{
-				Duration: max(r.Duration, time.Minute),
-				Opts:     opts,
-			})
 		})
-		logPrefix := fmt.Sprintf("attempt #%d to run %q on base", doneRuns, ret.reproReport.Title)
-		if errors.Is(runErr, context.Canceled) {
-			// Just exit without sending anything over the channel.
-			log.Logf(1, "%s: aborting due to context cancelation", logPrefix)
-			return
-		}
-		if runErr != nil || err != nil {
-			log.Logf(1, "%s: skipping due to errors: %v / %v", logPrefix, runErr, err)
-			continue
-		}
-		doneRuns++
-		if result != nil && result.Report != nil {
-			log.Logf(1, "%s: crashed with %s", logPrefix, result.Report.Title)
-			ret.crashReport = result.Report
-			break
-		} else {
-			log.Logf(1, "%s: did not crash", logPrefix)
-		}
+	}
+	wg.Wait()
+	if ctx.Err() != nil {
+		return
+	}
+	if aborted && crashReport == nil {
+		log.Logf(0, "%s: aborting base verification after repeated VM errors", r.Report.Title)
+		return
+	}
+	ret := reproRunnerResult{
+		reproReport: r.Report,
+		crashReport: crashReport,
+		repro:       r,
+		fullRepro:   fullRepro,
 	}
 	select {
 	case rr.done <- ret:
 	case <-ctx.Done():
 	}
+}
+
+func runSlotOnBase(ctx context.Context, k Kernel, r *repro.Result,
+	progData []byte, baseDur time.Duration, slot int) (*report.Report, bool) {
+	opts := r.Opts
+	opts.Repeat = true
+	if slot%3 != 2 {
+		// Two times out of 3, test with Threaded=true.
+		// The third time we leave it as it was in the reproducer (in case it was important).
+		opts.Threaded = true
+	}
+	pool := k.Pool()
+	const maxAttemptsPerSlot = 5
+	for range maxAttemptsPerSlot {
+		if ctx.Err() != nil {
+			return nil, false
+		}
+		var err error
+		var result *instance.RunResult
+		runErr := pool.Run(ctx, func(ctx context.Context, inst *vm.Instance,
+			updInfo dispatcher.UpdateInfo) {
+			execInst, setupErr := instance.SetupExecProg(inst, k.Config(), k.Reporter(),
+				&instance.OptionalConfig{Context: ctx})
+			if setupErr != nil {
+				err = setupErr
+				return
+			}
+			result, err = execInst.RunSyzProg(progData, instance.RunOptions{
+				Duration: baseDur,
+				Opts:     opts,
+			})
+		})
+		logPrefix := fmt.Sprintf("attempt #%d to run %q on base", slot, r.Report.Title)
+		if ctx.Err() != nil {
+			log.Logf(1, "%s: aborting due to context cancelation", logPrefix)
+			return nil, false
+		}
+		if runErr != nil || err != nil {
+			log.Logf(1, "%s: skipping due to errors: %v / %v", logPrefix, runErr, err)
+			continue
+		}
+		if result != nil && result.Report != nil {
+			log.Logf(1, "%s: crashed with %s", logPrefix, result.Report.Title)
+			return result.Report, true
+		}
+		log.Logf(1, "%s: did not crash", logPrefix)
+		return nil, true
+	}
+	return nil, false
 }
 
 type runner interface {

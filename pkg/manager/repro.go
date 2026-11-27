@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/report"
+	"github.com/google/syzkaller/pkg/report/crash"
 	"github.com/google/syzkaller/pkg/repro"
 	"github.com/google/syzkaller/pkg/stat"
 )
@@ -31,6 +32,7 @@ type Crash struct {
 	Manual        bool
 	ExtReqID      int64 // set if FromDashboard is true
 	FullRepro     bool  // used by the diff fuzzer to do a full scale reproduction
+	Focused       bool  // crash implicated files or symbols modified by the patch series
 	*report.Report
 	TailReports []*report.Report
 	MemoryDump  string
@@ -147,13 +149,13 @@ func (r *ReproLoop) popCrash() *Crash {
 	defer r.mu.Unlock()
 
 	newBetter := func(base, new *Crash) bool {
-		// If diff fuzzed has requested a full reproduction, do it first.
+		baseTitle, newTitle := base.FullTitle(), new.FullTitle()
+		// If diff fuzzer has requested a full reproduction, do it first.
 		if base.FullRepro != new.FullRepro {
 			return new.FullRepro
 		}
 		// The more times we failed, the less likely we are to actually
 		// find a reproducer. Give preference to not yet attempted repro runs.
-		baseTitle, newTitle := base.FullTitle(), new.FullTitle()
 		if r.attempts[baseTitle] != r.attempts[newTitle] {
 			return r.attempts[newTitle] < r.attempts[baseTitle]
 		}
@@ -161,7 +163,19 @@ func (r *ReproLoop) popCrash() *Crash {
 		if new.Manual != base.Manual {
 			return new.Manual
 		}
-		// Then, deprioritize hub reproducers.
+		// Then, dashboard reproducers.
+		if new.FromDashboard != base.FromDashboard {
+			return new.FromDashboard
+		}
+		// Prioritize crashes directly hitting modified files or functions.
+		if new.Focused != base.Focused {
+			return new.Focused
+		}
+		// Deprioritize hangs, since each hang attempt requires waiting out full hang timeouts.
+		if newHang, baseHang := isHangCrash(new), isHangCrash(base); newHang != baseHang {
+			return !newHang
+		}
+		// Finally, deprioritize hub reproducers.
 		if new.FromHub != base.FromHub {
 			return !new.FromHub
 		}
@@ -183,6 +197,10 @@ func (r *ReproLoop) popCrash() *Crash {
 	crash := r.queue[idx]
 	r.queue = slices.Delete(r.queue, idx, idx+1)
 	return crash
+}
+
+func isHangCrash(c *Crash) bool {
+	return c.Report != nil && c.Type == crash.Hang
 }
 
 func (r *ReproLoop) Loop(ctx context.Context) {

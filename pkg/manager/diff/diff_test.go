@@ -50,6 +50,7 @@ func newTestEnv(t *testing.T, cfg *Config) *testEnv {
 	diffCtx := &diffContext{
 		cfg:           *cfg,
 		doneRepro:     make(chan *manager.ReproResult, 1),
+		focusedCrash:  make(chan struct{}, 1),
 		store:         cfg.Store,
 		reproAttempts: map[string]int{},
 		patchedOnly:   cfg.PatchedOnly,

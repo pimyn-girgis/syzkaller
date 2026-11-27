@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/syzkaller/pkg/report"
+	"github.com/google/syzkaller/pkg/report/crash"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -173,6 +174,49 @@ func TestEnqueueTriggersRepro(t *testing.T) {
 	crash := <-mock.run
 	assert.Equal(t, "C", crash.crash.FullTitle())
 	done()
+}
+
+func TestReproFocusedPriority(t *testing.T) {
+	mock := &reproMgrMock{
+		run: make(chan runCallback),
+	}
+	obj := NewReproLoop(mock, 1, false)
+
+	dashboard := &Crash{Report: &report.Report{Title: "dashboard"}, FromDashboard: true}
+	focused := &Crash{Report: &report.Report{Title: "focused"}, Focused: true}
+	focusedHang := &Crash{
+		Report:  &report.Report{Title: "INFO: task hung in focused", Type: crash.Hang},
+		Focused: true,
+	}
+	hub := &Crash{Report: &report.Report{Title: "hub"}, FromHub: true}
+	plain := &Crash{Report: &report.Report{Title: "plain"}}
+	plainHang := &Crash{Report: &report.Report{Title: "INFO: task hung in plain", Type: crash.Hang}}
+
+	obj.Enqueue(plainHang)
+	obj.Enqueue(plain)
+	obj.Enqueue(hub)
+	obj.Enqueue(focusedHang)
+	obj.Enqueue(focused)
+	obj.Enqueue(focused) // Second attempt runs after all first-attempt crashes.
+	obj.Enqueue(dashboard)
+
+	ctx := t.Context()
+	go obj.Loop(ctx)
+
+	wantOrder := []string{
+		"dashboard",
+		"focused",
+		"INFO: task hung in focused",
+		"plain",
+		"hub",
+		"INFO: task hung in plain",
+		"focused",
+	}
+	for _, want := range wantOrder {
+		called := <-mock.run
+		assert.Equal(t, want, called.crash.Title)
+		called.ret <- &ReproResult{}
+	}
 }
 
 type reproMgrMock struct {

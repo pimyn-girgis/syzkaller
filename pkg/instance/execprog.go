@@ -29,6 +29,7 @@ import (
 type ExecutorLogger func(int, string, ...any)
 
 type OptionalConfig struct {
+	Context            context.Context
 	Logf               ExecutorLogger
 	OldFlagsCompatMode bool
 	BeforeContextLen   int
@@ -141,9 +142,16 @@ func (inst *ExecProgInstance) runCommand(command string, opts RunOptions) (*RunR
 	if opts.ConsoleOnlyCrash {
 		vmOpts = append(vmOpts, vm.WithConsoleOnlyCrash())
 	}
-	ctxTimeout, cancel := context.WithTimeout(context.Background(), opts.Duration)
+	parentCtx := inst.Context
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	ctxTimeout, cancel := context.WithTimeout(parentCtx, opts.Duration)
 	defer cancel()
 	output, reps, err := inst.VMInstance.Run(ctxTimeout, inst.reporter, command, vmOpts...)
+	if parentCtx.Err() != nil {
+		return nil, parentCtx.Err()
+	}
 	var rep *report.Report
 	if len(reps) > 0 {
 		rep = reps[0]
@@ -403,9 +411,13 @@ func (inst *ExecProgInstance) retrieveCoverageFiles(vmCoverFilePrefix string, nc
 	files = append(files, fmt.Sprintf("%s_prog1.extra", vmCoverFilePrefix))
 
 	coverage := make([][]uint64, 0, ncalls)
+	parentCtx := inst.Context
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
 	for _, file := range files {
 		catCmd := "cat " + file + " 2>/dev/null || true"
-		catCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		catCtx, cancel := context.WithTimeout(parentCtx, time.Minute)
 		catOutput, err := inst.runStreamAndCollectStdoutToBuf(catCtx, catCmd)
 		cancel()
 		if err != nil {

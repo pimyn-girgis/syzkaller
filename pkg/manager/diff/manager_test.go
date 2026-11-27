@@ -11,9 +11,12 @@ import (
 
 	"github.com/google/syzkaller/pkg/corpus"
 	"github.com/google/syzkaller/pkg/manager"
+	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/report"
 	"github.com/google/syzkaller/pkg/repro"
 	_ "github.com/google/syzkaller/prog/test"
+	"github.com/google/syzkaller/vm"
+	"github.com/google/syzkaller/vm/dispatcher"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -259,4 +262,203 @@ func TestMonitorPatchedCoverage(t *testing.T) {
 			assert.ErrorIs(t, env.diffCtx.monitorPatchedCoverage(ctx), test.wantErr)
 		})
 	}
+}
+
+func TestIsFocusedCrash(t *testing.T) {
+	env := newTestEnv(t, nil)
+	env.new.ConfigVal.Experimental.FocusAreas = []mgrconfig.FocusArea{
+		{
+			Name: filesArea,
+			Filter: mgrconfig.CovFilterCfg{
+				Files: []string{"kernel/bpf/verifier.c", "net/packet/af_packet.c"},
+			},
+		},
+		{
+			Name: symbolsArea,
+			Filter: mgrconfig.CovFilterCfg{
+				Functions: []string{"^reg_bounds_sanity_check$", "^null_process_zoned_cmd$"},
+			},
+		},
+	}
+
+	assert.True(t, env.diffCtx.isFocusedCrash(&report.Report{
+		Title:      "WARNING in foo",
+		GuiltyFile: "kernel/bpf/verifier.c",
+	}))
+	assert.True(t, env.diffCtx.isFocusedCrash(&report.Report{
+		Title:  "KASAN: slab-out-of-bounds in __kasan_check",
+		Report: []byte("Call Trace:\n reg_bounds_sanity_check.isra.0+0x42/0x100\n"),
+	}))
+	assert.True(t, env.diffCtx.isFocusedCrash(&report.Report{
+		Title:  "UBSAN: shift-out-of-bounds in null_process_zoned_cmd",
+		Report: []byte("Call Trace:\n null_process_zoned_cmd+0x40/0x100\n"),
+	}))
+	assert.True(t, env.diffCtx.isFocusedCrash(&report.Report{
+		Title:      "WARNING in __dev_queue_xmit",
+		GuiltyFile: "net/core/dev.c",
+		Report: []byte(`Call Trace:
+ tpacket_snd net/packet/af_packet.c:2851 [inline]
+ packet_sendmsg+0x2bf3/0x5140
+`),
+	}))
+	assert.False(t, env.diffCtx.isFocusedCrash(&report.Report{
+		Title:      "kernel BUG in ocfs2_iget",
+		GuiltyFile: "fs/ocfs2/inode.c",
+		Report:     []byte("Call Trace:\n ocfs2_iget+0x10/0x80\n"),
+	}))
+}
+
+func TestDiffFocusedCrashEarlyRepro(t *testing.T) {
+	// Even while corpus triage is still 5% and MaxTriageTime is 1 hour,
+	// a focused crash when FuzzingVMs > 0 must wake reproLoop immediately,
+	// without allowing unfocused crashes to hijack early reproduction slots.
+	unfocusedStarted := make(chan struct{}, 1)
+	env := newTestEnv(t, &Config{
+		MaxTriageTime: time.Hour,
+		runRepro: func(ctx context.Context, output []byte,
+			reproEnv repro.Environment) (*repro.Result, *repro.Stats, error) {
+			if string(output) == "unfocused" {
+				unfocusedStarted <- struct{}{}
+				return nil, nil, errors.New("unexpected unfocused repro")
+			}
+			return mockRepro("WARNING in reg_bounds_sanity_check", nil)(ctx, output, reproEnv)
+		},
+		runner: newMockRunner(func(ctx context.Context, k Kernel, r *repro.Result, fullRepro bool) *reproRunnerResult {
+			return &reproRunnerResult{
+				reproReport: r.Report,
+				repro:       r,
+				crashReport: nil,
+				fullRepro:   true,
+			}
+		}),
+	})
+	defer env.close()
+
+	env.new.PoolVal = newTestPool(3)
+	env.new.TriageProgressVal = 0.05
+	env.new.ConfigVal.FuzzingVMs = 1
+	env.new.ConfigVal.Experimental.FocusAreas = []mgrconfig.FocusArea{
+		{
+			Name:   filesArea,
+			Filter: mgrconfig.CovFilterCfg{Files: []string{"kernel/bpf/verifier.c"}},
+		},
+	}
+	env.start()
+
+	env.new.CrashesCh <- &report.Report{
+		Title:      "WARNING in folio_memcg",
+		GuiltyFile: "mm/memcontrol.c",
+		Output:     []byte("unfocused"),
+		Report:     []byte("log"),
+	}
+	env.new.CrashesCh <- &report.Report{
+		Title:      "WARNING in reg_bounds_sanity_check",
+		GuiltyFile: "kernel/bpf/verifier.c",
+		Output:     []byte("focused"),
+		Report:     []byte("log"),
+	}
+	select {
+	case bug := <-env.diffCtx.patchedOnly:
+		assert.Equal(t, "WARNING in reg_bounds_sanity_check", bug.Report.Title)
+	case <-time.After(testTimeout):
+		t.Fatal("expected immediate reproduction of focused crash before corpus triage completes")
+	}
+	select {
+	case <-unfocusedStarted:
+		t.Fatal("unfocused crash should not start reproducing before triage completes")
+	default:
+	}
+}
+
+func TestDiffCancelActiveReproOnBaseCrash(t *testing.T) {
+	reproStarted := make(chan struct{}, 1)
+	reproCancelled := make(chan struct{}, 1)
+	env := newTestEnv(t, &Config{
+		runRepro: func(ctx context.Context, output []byte,
+			reproEnv repro.Environment) (*repro.Result, *repro.Stats, error) {
+			reproStarted <- struct{}{}
+			<-ctx.Done()
+			reproCancelled <- struct{}{}
+			return nil, nil, ctx.Err()
+		},
+	})
+	defer env.close()
+
+	env.new.FinishCorpusTriage()
+	env.start()
+
+	env.new.CrashesCh <- &report.Report{Title: "race_crash", Report: []byte("log")}
+	select {
+	case <-reproStarted:
+	case <-time.After(testTimeout):
+		t.Fatal("expected repro to start")
+	}
+
+	env.base.CrashesCh <- &report.Report{Title: "race_crash", Report: []byte("base log")}
+	select {
+	case <-reproCancelled:
+	case <-time.After(testTimeout):
+		t.Fatal("expected active repro to be cancelled on matching base crash")
+	}
+	env.waitForStatus("race_crash", manager.DiffBugStatusIgnored)
+}
+
+func TestDiffDeferredUnfocusedPreservesReproducedStatus(t *testing.T) {
+	// If an unfocused crash is deferred while triage is incomplete, and an early focused
+	// reproduction already reproduces under that unfocused crash's title before triage
+	// finishes, draining deferredUnfocused must preserve Completed status rather than
+	// overwriting it with Ignored.
+	env := newTestEnv(t, &Config{
+		MaxTriageTime: 80 * time.Millisecond,
+		runRepro:      mockRepro("BUG: Bad page state in __handle_mm_fault", nil),
+		runner: newMockRunner(func(ctx context.Context, k Kernel, r *repro.Result, fullRepro bool) *reproRunnerResult {
+			return &reproRunnerResult{
+				reproReport: r.Report,
+				repro:       r,
+				crashReport: nil,
+				fullRepro:   true,
+			}
+		}),
+	})
+	defer env.close()
+
+	env.new.PoolVal = newTestPool(3)
+	env.new.TriageProgressVal = 0.05
+	env.new.ConfigVal.FuzzingVMs = 1
+	env.new.ConfigVal.Experimental.FocusAreas = []mgrconfig.FocusArea{
+		{
+			Name:   filesArea,
+			Filter: mgrconfig.CovFilterCfg{Files: []string{"net/rds/message.c"}},
+		},
+	}
+	env.start()
+
+	env.new.CrashesCh <- &report.Report{
+		Title:      "BUG: Bad page state in __handle_mm_fault",
+		GuiltyFile: "mm/memory.c",
+		Output:     []byte("deferred"),
+		Report:     []byte("log"),
+	}
+	env.new.CrashesCh <- &report.Report{
+		Title:      "WARNING in rds_message_zcopy_from_user",
+		GuiltyFile: "net/rds/message.c",
+		Output:     []byte("focused"),
+		Report:     []byte("log"),
+	}
+	select {
+	case bug := <-env.diffCtx.patchedOnly:
+		assert.Equal(t, "BUG: Bad page state in __handle_mm_fault", bug.Report.Title)
+	case <-time.After(testTimeout):
+		t.Fatal("expected patchedOnly report")
+	}
+	// Wait past MaxTriageTime so deferredUnfocused is drained.
+	time.Sleep(150 * time.Millisecond)
+	env.waitForStatus("BUG: Bad page state in __handle_mm_fault", manager.DiffBugStatusCompleted)
+}
+
+func newTestPool(count int) *dispatcher.Pool[*vm.Instance] {
+	return dispatcher.NewPool[*vm.Instance](count, func(ctx context.Context, index int) (*vm.Instance, error) {
+		return &vm.Instance{}, nil
+	}, func(ctx context.Context, inst *vm.Instance, upd dispatcher.UpdateInfo) {
+	})
 }

@@ -114,7 +114,8 @@ func TestSimplifies(t *testing.T) {
 
 type testExecInterface struct {
 	// For now only do the simplest imitation.
-	run func([]byte) (*instance.RunResult, error)
+	run    func([]byte) (*instance.RunResult, error)
+	runSyz func(context.Context, []byte, instance.RunOptions) (*instance.RunResult, error)
 }
 
 func (tei *testExecInterface) RunC(_ context.Context, p *prog.Prog, _ instance.RunOptions,
@@ -122,8 +123,11 @@ func (tei *testExecInterface) RunC(_ context.Context, p *prog.Prog, _ instance.R
 	return tei.run(p.Serialize())
 }
 
-func (tei *testExecInterface) RunSyz(_ context.Context, syzProg []byte, _ instance.RunOptions,
+func (tei *testExecInterface) RunSyz(ctx context.Context, syzProg []byte, opts instance.RunOptions,
 	_ instance.ExecutorLogger) (*instance.RunResult, error) {
+	if tei.runSyz != nil {
+		return tei.runSyz(ctx, syzProg, opts)
+	}
 	return tei.run(syzProg)
 }
 
@@ -451,4 +455,106 @@ func TestReproDuration(t *testing.T) {
 			require.Equal(t, tt.want, got)
 		})
 	}
+}
+
+func TestFastMultiProgReproAndCancel(t *testing.T) {
+	mgrConfig := &mgrconfig.Config{
+		Derived: mgrconfig.Derived{
+			TargetOS:     targets.Linux,
+			TargetVMArch: targets.AMD64,
+			SysTarget:    targets.Get(targets.Linux, targets.AMD64),
+		},
+		Sandbox: "namespace",
+	}
+	var err error
+	mgrConfig.Target, err = prog.GetTarget(targets.Linux, targets.AMD64)
+	require.NoError(t, err)
+	reporter, err := report.NewReporter(mgrConfig)
+	require.NoError(t, err)
+
+	env := Environment{
+		Config:   mgrConfig,
+		Features: flatrpc.AllFeatures,
+		Fast:     true,
+		Reporter: reporter,
+		logf:     t.Logf,
+	}
+
+	t.Run("fast_multi_prog_bisect_at_short_timeout", func(t *testing.T) {
+		var maxDuration time.Duration
+		calls := 0
+		result, _, err := runInner(context.Background(), []byte(testReproLog), env, &testExecInterface{
+			runSyz: func(_ context.Context, syzProg []byte, opts instance.RunOptions) (*instance.RunResult, error) {
+				calls++
+				maxDuration = max(maxDuration, opts.Duration)
+				return testExecRunner(syzProg)
+			},
+		})
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		assert.False(t, result.CRepro)
+		assert.Equal(t, "alarm(0x5)\npause()\nalarm(0xa)\ngetpid()\n", string(result.Prog.Serialize()))
+		assert.Less(t, maxDuration, time.Minute, "fast mode must bisect multi-prog crash at short timeout")
+		assert.LessOrEqual(t, calls, 12, "fast mode must skip call-by-call minimization before base check")
+	})
+
+	t.Run("fast_multi_prog_exceeding_max_calls_minimizes", func(t *testing.T) {
+		execLog := "2015/12/21 12:18:05 executing program 1:\n"
+		for i := range prog.MaxCalls {
+			if i == 10 {
+				execLog += "pause()\n"
+			} else {
+				execLog += "getpid()\n"
+			}
+		}
+		execLog += "2015/12/21 12:18:10 executing program 2:\n"
+		for i := range prog.MaxCalls {
+			if i == 10 {
+				execLog += "alarm(0xa)\n"
+			} else {
+				execLog += "getpid()\n"
+			}
+		}
+		result, _, err := runInner(context.Background(), []byte(execLog), env, &testExecInterface{
+			run: testExecRunner,
+		})
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		assert.Equal(t, expectedReproducer, string(result.Prog.Serialize()))
+	})
+
+	t.Run("fast_hang_preserves_no_output_timeout", func(t *testing.T) {
+		hangCfg := *mgrConfig
+		hangCfg.Timeouts.NoOutputRunningTime = 3 * time.Minute
+		hangEnv := env
+		hangEnv.Config = &hangCfg
+		hangLog := "2015/12/21 12:18:05 executing program 1:\npause()\nINFO: task hung in foo\n"
+
+		var seenDuration time.Duration
+		result, _, err := runInner(context.Background(), []byte(hangLog), hangEnv, &testExecInterface{
+			runSyz: func(_ context.Context, _ []byte, opts instance.RunOptions) (*instance.RunResult, error) {
+				if seenDuration == 0 {
+					seenDuration = opts.Duration
+				}
+				return fakeCrashResult("INFO: task hung in foo"), nil
+			},
+		})
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		assert.Equal(t, 3*time.Minute, seenDuration)
+	})
+
+	t.Run("cancel_aborts_immediately_without_retries", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		calls := 0
+		_, _, err := runInner(ctx, []byte(testReproLog), env, &testExecInterface{
+			runSyz: func(runCtx context.Context, _ []byte, _ instance.RunOptions) (*instance.RunResult, error) {
+				calls++
+				cancel()
+				return nil, runCtx.Err()
+			},
+		})
+		require.ErrorIs(t, err, context.Canceled)
+		assert.Equal(t, 1, calls, "cancelled context must stop reproduction without retrying")
+	})
 }
