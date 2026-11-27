@@ -23,7 +23,7 @@ spec:
             path: /patched
           - name: config
             path: /tmp/config.json
-      timeout: 4h
+      timeout: 14h
       initContainers:
         - name: setup-repo
           image: ${IMAGE_PREFIX}fuzz-action:${IMAGE_TAG}

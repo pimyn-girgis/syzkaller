@@ -82,8 +82,8 @@ func TestSelectFuzzConfigs(t *testing.T) {
 			series:   makeStableRCSeries("net/core/sock.c", api.MaxRCFocusedPatches),
 		},
 		{
-			testName: "large-stable-rc-uses-unfocused-fallback",
-			result:   []*api.KernelFuzzConfig{mainline},
+			testName: "large-stable-rc-includes-matched-and-unfocused-fallback",
+			result:   []*api.KernelFuzzConfig{net, mainline},
 			series:   makeStableRCSeries("net/core/sock.c", api.MaxRCFocusedPatches+1),
 		},
 	}
@@ -102,15 +102,19 @@ func TestMergeKernelFuzzConfigs(t *testing.T) {
 			{
 				KernelConfig: "kasan_config",
 				Track:        "KASAN",
-				FuzzConfig: &api.FuzzConfig{
-					Focus: []string{"net"},
+				FuzzConfigs: []*api.FuzzConfig{
+					{
+						Focus: []string{"net"},
+					},
 				},
 			},
 			{
 				KernelConfig: "kmsan_config",
 				Track:        "KMSAN",
-				FuzzConfig: &api.FuzzConfig{
-					Focus: []string{"net"},
+				FuzzConfigs: []*api.FuzzConfig{
+					{
+						Focus: []string{"net"},
+					},
 				},
 			},
 		}, MergeKernelFuzzConfigs([]*api.KernelFuzzConfig{
@@ -131,8 +135,10 @@ func TestMergeKernelFuzzConfigs(t *testing.T) {
 			{
 				KernelConfig: "kasan_config",
 				Track:        "KASAN",
-				FuzzConfig: &api.FuzzConfig{
-					Focus: []string{"bpf", "net"},
+				FuzzConfigs: []*api.FuzzConfig{
+					{
+						Focus: []string{"bpf", "net"},
+					},
 				},
 			},
 		}, MergeKernelFuzzConfigs([]*api.KernelFuzzConfig{
@@ -145,6 +151,63 @@ func TestMergeKernelFuzzConfigs(t *testing.T) {
 				Track:        "KASAN",
 				KernelConfig: "kasan_config",
 				Focus:        "bpf",
+			},
+		}))
+	})
+	t.Run("priority-split-when-unfocused", func(t *testing.T) {
+		assert.Equal(t, []*MergedFuzzConfig{
+			{
+				KernelConfig: "kasan_config",
+				Track:        "KASAN",
+				FuzzConfigs: []*api.FuzzConfig{
+					{
+						Label:             "Fuzz (kvm)",
+						Focus:             []string{"kvm"},
+						FocusPaths:        []string{"^arch/x86/kvm/"},
+						ExcludeFocusPaths: []string{"^include/kvm/arm_"},
+						CorpusURLs:        []string{"root.db"},
+					},
+					{
+						Label:      "Fuzz (net)",
+						Focus:      []string{"net"},
+						FocusPaths: []string{"^net/"},
+						CorpusURLs: []string{"net.db"},
+					},
+					{
+						Focus:      nil,
+						CorpusURLs: []string{"fs.db", "net.db", "root.db"},
+					},
+				},
+			},
+		}, MergeKernelFuzzConfigs([]*api.KernelFuzzConfig{
+			{
+				Track:              "KASAN",
+				KernelConfig:       "kasan_config",
+				Focus:              "kvm",
+				Priority:           true,
+				PathRegexps:        []string{"^arch/x86/kvm/"},
+				ExcludePathRegexps: []string{"^include/kvm/arm_"},
+				CorpusURL:          "root.db",
+			},
+			{
+				Track:        "KASAN",
+				KernelConfig: "kasan_config",
+				Focus:        "net",
+				Priority:     true,
+				PathRegexps:  []string{"^net/"},
+				CorpusURL:    "net.db",
+			},
+			{
+				Track:        "KASAN",
+				KernelConfig: "kasan_config",
+				Focus:        "fs",
+				CorpusURL:    "fs.db",
+			},
+			{
+				Track:        "KASAN",
+				KernelConfig: "kasan_config",
+				Focus:        "",
+				CorpusURL:    "root.db",
 			},
 		}))
 	})
@@ -307,11 +370,13 @@ func TestDefaultFuzzTargetsSelection(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			configs := MergeKernelFuzzConfigs(SelectFuzzConfigs(makeTestSeries(tc.files), targets))
 			require.Len(t, configs, 1)
-			assert.Equal(t, tc.wantFocus, configs[0].FuzzConfig.Focus)
-			assert.Equal(t, tc.skipCoverCheck, configs[0].FuzzConfig.SkipCoverCheck)
-			assert.NotEmpty(t, configs[0].FuzzConfig.CorpusURLs)
+			require.Len(t, configs[0].FuzzConfigs, 1)
+			fuzzCfg := configs[0].FuzzConfigs[0]
+			assert.Equal(t, tc.wantFocus, fuzzCfg.Focus)
+			assert.Equal(t, tc.skipCoverCheck, fuzzCfg.SkipCoverCheck)
+			assert.NotEmpty(t, fuzzCfg.CorpusURLs)
 			if tc.wantCorpora != nil {
-				assert.Equal(t, tc.wantCorpora, configs[0].FuzzConfig.CorpusURLs)
+				assert.Equal(t, tc.wantCorpora, fuzzCfg.CorpusURLs)
 			}
 		})
 	}

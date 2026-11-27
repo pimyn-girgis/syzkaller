@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	pkgbuild "github.com/google/syzkaller/pkg/build"
 	"github.com/google/syzkaller/pkg/db"
@@ -221,4 +222,48 @@ func TestFilterFindingCandidates(t *testing.T) {
 	candidates := FilterFindingCandidates(bugs)
 	require.Len(t, candidates, 1)
 	assert.Equal(t, "candidate crash 1", candidates[0].Title)
+}
+
+func TestFuzzDurationAndMaxTriageDuration(t *testing.T) {
+	d, err := FuzzDuration("3h", &api.FuzzConfig{})
+	require.NoError(t, err)
+	assert.Equal(t, 3*time.Hour, d)
+
+	d, err = FuzzDuration("3h", &api.FuzzConfig{FuzzTime: api.StableRCFuzzDuration})
+	require.NoError(t, err)
+	assert.Equal(t, 12*time.Hour, d)
+
+	_, err = FuzzDuration("3h", &api.FuzzConfig{FuzzTime: "bad"})
+	require.Error(t, err)
+
+	assert.Equal(t, 7*time.Minute+30*time.Second, maxTriageDuration(15*time.Minute))
+	assert.Equal(t, 30*time.Minute, maxTriageDuration(3*time.Hour))
+	assert.Equal(t, 30*time.Minute, maxTriageDuration(12*time.Hour))
+}
+
+func TestFilterPatchesByFocusPaths(t *testing.T) {
+	patch := []byte(`diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -1 +1 @@
+-a
++b
+diff --git a/net/bluetooth/hci.c b/net/bluetooth/hci.c
+--- a/net/bluetooth/hci.c
++++ b/net/bluetooth/hci.c
+@@ -1 +1 @@
+-a
++b
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -1 +1 @@
+-a
++b
+`)
+	got := filterPatchesByFocusPaths([][]byte{patch}, []string{"^net/"}, []string{"^net/bluetooth/"})
+	require.Len(t, got, 1)
+	assert.Contains(t, string(got[0]), "net/ipv4/tcp.c")
+	assert.NotContains(t, string(got[0]), "net/bluetooth/hci.c")
+	assert.NotContains(t, string(got[0]), "fs/ext4/inode.c")
 }

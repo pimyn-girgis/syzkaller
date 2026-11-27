@@ -10,6 +10,7 @@
   exclude_path_regexps:
     - "^include/kvm/arm_"
   focus: kvm
+  priority: true
   corpus_url: https://storage.googleapis.com/syzkaller/corpus/ci-upstream-kasan-gce-root-corpus.db
   campaigns:
     - track: KASAN
@@ -41,6 +42,7 @@
   exclude_path_regexps:
     - "^net/bluetooth/|^include/net/bluetooth/"
   focus: net
+  priority: true
   corpus_url: https://storage.googleapis.com/syzkaller/corpus/ci-upstream-net-kasan-gce-corpus.db
   campaigns:
     - track: KASAN
@@ -55,6 +57,7 @@
 - path_regexps:
     - "^fs/(nfs|nfsd|nfs_common|lockd|smb|cifs|afs|ceph|9p|netfs|dlm|ocfs2)/"
   focus: net
+  priority: true
   corpus_url: https://storage.googleapis.com/syzkaller/corpus/ci-upstream-net-kasan-gce-corpus.db
   campaigns:
     - track: KASAN

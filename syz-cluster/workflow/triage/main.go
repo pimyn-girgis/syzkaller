@@ -231,18 +231,28 @@ func (triager *seriesTriager) buildTestTarget(ctx context.Context, series *api.S
 		Arch:          result.Arch,
 		EnableConfigs: triager.aiVerdict.EnableConfigs,
 	}
-	fuzzCfg := new(api.FuzzConfig)
-	if target.FuzzConfig != nil {
-		*fuzzCfg = *target.FuzzConfig
+	var fuzzCfgs []*api.FuzzConfig
+	for _, src := range target.FuzzConfigs {
+		if src == nil {
+			continue
+		}
+		fuzzCfg := new(api.FuzzConfig)
+		*fuzzCfg = *src
+		if len(fuzzCfg.FocusPaths) == 0 {
+			fuzzCfg.FocusSymbols = triager.aiVerdict.FocusSymbols
+		}
+		fuzzCfg.BaseCommit = result.Commit
+		fuzzCfg.BaseTree = result.Tree.Name
+		if series.IsStableRC() && fuzzCfg.FuzzTime == "" {
+			fuzzCfg.FuzzTime = api.StableRCFuzzDuration
+		}
+		fuzzCfgs = append(fuzzCfgs, fuzzCfg)
 	}
-	fuzzCfg.FocusSymbols = triager.aiVerdict.FocusSymbols
-	fuzzCfg.BaseCommit = result.Commit
-	fuzzCfg.BaseTree = result.Tree.Name
 	testTarget := &api.TestTarget{
 		Base:    base,
 		Patched: base,
 		Track:   target.Track,
-		Fuzz:    fuzzCfg,
+		Fuzz:    fuzzCfgs,
 	}
 	testTarget.Patched.SeriesID = series.ID
 	retestFindings, err := triager.client.ListPreviousFindings(ctx, &api.ListPreviousFindingsReq{

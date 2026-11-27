@@ -4,6 +4,7 @@
 package triage
 
 import (
+	"fmt"
 	"regexp"
 	"slices"
 
@@ -11,11 +12,13 @@ import (
 )
 
 func SelectFuzzConfigs(series *api.Series, targets []*api.FuzzTriageTarget) []*api.KernelFuzzConfig {
-	// Large stable RCs touch many subsystems across the kernel; fuzz them unfocused.
+	ret := selectByPaths(targets, series.ModifiedFiles())
+	// Large stable RCs touch many subsystems across the kernel; include the unfocused fallback
+	// so the main campaign runs unfocused while retaining matched corpora and priority targets.
 	if series.IsStableRC() && len(series.Patches) > api.MaxRCFocusedPatches {
-		return defaultTargets(targets)
+		return append(ret, defaultTargets(targets)...)
 	}
-	if ret := selectByPaths(targets, series.ModifiedFiles()); len(ret) > 0 {
+	if len(ret) > 0 {
 		return ret
 	}
 	return defaultTargets(targets)
@@ -84,6 +87,15 @@ func expandCampaigns(config *api.FuzzTriageTarget) []*api.KernelFuzzConfig {
 		if c.CorpusURL == "" {
 			c.CorpusURL = config.CorpusURL
 		}
+		c.Priority = c.Priority || config.Priority
+		if c.Priority {
+			if len(c.PathRegexps) == 0 {
+				c.PathRegexps = config.PathRegexps
+			}
+			if len(c.ExcludePathRegexps) == 0 {
+				c.ExcludePathRegexps = config.ExcludePathRegexps
+			}
+		}
 		ret = append(ret, &c)
 	}
 	return ret
@@ -92,7 +104,7 @@ func expandCampaigns(config *api.FuzzTriageTarget) []*api.KernelFuzzConfig {
 type MergedFuzzConfig struct {
 	KernelConfig string
 	Track        string
-	FuzzConfig   *api.FuzzConfig
+	FuzzConfigs  []*api.FuzzConfig
 }
 
 func MergeKernelFuzzConfigs(configs []*api.KernelFuzzConfig) []*MergedFuzzConfig {
@@ -118,9 +130,51 @@ func MergeKernelFuzzConfigs(configs []*api.KernelFuzzConfig) []*MergedFuzzConfig
 		ret = append(ret, &MergedFuzzConfig{
 			KernelConfig: key.config,
 			Track:        key.track,
-			FuzzConfig:   mergeFuzzConfigs(groups[key]),
+			FuzzConfigs:  mergeCampaignGroup(groups[key]),
 		})
 	}
+	return ret
+}
+
+func mergeCampaignGroup(configs []*api.KernelFuzzConfig) []*api.FuzzConfig {
+	mainCfg := mergeFuzzConfigs(configs)
+	if len(mainCfg.Focus) > 0 {
+		return []*api.FuzzConfig{mainCfg}
+	}
+	// When a series broadens to an unfocused campaign (e.g. on large stable/LTS RCs),
+	// also emit dedicated force-focused campaigns for matched high-priority subsystems
+	// (such as KVM and networking) sharing the same base/patched kernel builds.
+	var (
+		priorityOrder []string
+		byFocus       = map[string][]*api.KernelFuzzConfig{}
+	)
+	for _, cfg := range configs {
+		if !cfg.Priority || cfg.Focus == "" {
+			continue
+		}
+		if _, ok := byFocus[cfg.Focus]; !ok {
+			priorityOrder = append(priorityOrder, cfg.Focus)
+		}
+		byFocus[cfg.Focus] = append(byFocus[cfg.Focus], cfg)
+	}
+	var ret []*api.FuzzConfig
+	for _, focus := range priorityOrder {
+		prioCfg := mergeFuzzConfigs(byFocus[focus])
+		prioCfg.Label = fmt.Sprintf("Fuzz (%s)", focus)
+		var paths, excludePaths []string
+		for _, cfg := range byFocus[focus] {
+			paths = append(paths, cfg.PathRegexps...)
+			excludePaths = append(excludePaths, cfg.ExcludePathRegexps...)
+		}
+		if len(paths) > 0 {
+			prioCfg.FocusPaths = unique(paths)
+		}
+		if len(excludePaths) > 0 {
+			prioCfg.ExcludeFocusPaths = unique(excludePaths)
+		}
+		ret = append(ret, prioCfg)
+	}
+	ret = append(ret, mainCfg)
 	return ret
 }
 

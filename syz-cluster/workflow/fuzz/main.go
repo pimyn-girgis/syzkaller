@@ -50,15 +50,15 @@ func main() {
 		app.Fatalf("--config, --session, --time and --test_name must be set")
 	}
 	client := app.DefaultClient()
-	d, err := time.ParseDuration(*flagTime)
-	if err != nil {
-		app.Fatalf("invalid --time: %v", err)
-	}
 	if !prog.GitRevisionKnown() {
 		log.Fatalf("the binary is built without the git revision information")
 	}
 
 	config := readFuzzConfig()
+	d, err := fuzz.FuzzDuration(*flagTime, config)
+	if err != nil {
+		app.Fatalf("invalid fuzz duration: %v", err)
+	}
 	ctx := context.Background()
 	if err := reportStatus(ctx, config, client, api.TestRunning, nil); err != nil {
 		app.Fatalf("failed to report the test: %v", err)

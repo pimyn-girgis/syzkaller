@@ -5,6 +5,7 @@
 package fuzz
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
 	pkgbuild "github.com/google/syzkaller/pkg/build"
@@ -78,6 +80,9 @@ func Run(ctx context.Context, params *Params) error {
 	if params.Series != nil {
 		patches = params.Series.PatchBodies()
 	}
+	if len(params.Config.FocusPaths) > 0 {
+		patches = filterPatchesByFocusPaths(patches, params.Config.FocusPaths, params.Config.ExcludeFocusPaths)
+	}
 	diff.PatchFocusAreas(patched, patches, params.BaseSymbols.Text, params.PatchedSymbols.Text)
 	if params.Series != nil {
 		setupAIFocusAreas(params.Config, patched, params.Series)
@@ -108,7 +113,7 @@ func Run(ctx context.Context, params *Params) error {
 			PatchedOnly:        bugs,
 			BaseCrashes:        baseCrashes,
 			Store:              params.Store,
-			MaxTriageTime:      params.Timeout / 2,
+			MaxTriageTime:      maxTriageDuration(params.Timeout),
 			FuzzToReachPatched: fuzzToReachPatched(params.Config),
 			IgnoreCrash: func(ctx context.Context, title string) (bool, error) {
 				if !titleRe.MatchString(title) {
@@ -290,6 +295,82 @@ func compileTitleFilter(config *api.FuzzConfig) (*regexp.Regexp, error) {
 		return nil, fmt.Errorf("invalid BugTitleRe regexp: %w", err)
 	}
 	return re, nil
+}
+
+const maxCorpusTriageTime = 30 * time.Minute
+
+// FuzzDuration resolves the campaign duration, preferring FuzzConfig.FuzzTime over defaultTime.
+func FuzzDuration(defaultTime string, config *api.FuzzConfig) (time.Duration, error) {
+	raw := defaultTime
+	if config != nil && config.FuzzTime != "" {
+		raw = config.FuzzTime
+	}
+	return time.ParseDuration(raw)
+}
+
+func maxTriageDuration(timeout time.Duration) time.Duration {
+	return min(timeout/2, maxCorpusTriageTime)
+}
+
+func filterPatchesByFocusPaths(patches [][]byte, includePatterns, excludePatterns []string) [][]byte {
+	var include, exclude []*regexp.Regexp
+	for _, p := range includePatterns {
+		if re, err := regexp.Compile(p); err == nil {
+			include = append(include, re)
+		}
+	}
+	if len(include) == 0 {
+		return patches
+	}
+	for _, p := range excludePatterns {
+		if re, err := regexp.Compile(p); err == nil {
+			exclude = append(exclude, re)
+		}
+	}
+	matchesFile := func(file string) bool {
+		matched := false
+		for _, re := range include {
+			if re.MatchString(file) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+		for _, re := range exclude {
+			if re.MatchString(file) {
+				return false
+			}
+		}
+		return true
+	}
+
+	var out [][]byte
+	for _, patch := range patches {
+		var kept bytes.Buffer
+		lines := bytes.SplitAfter(patch, []byte("\n"))
+		inBlock := false
+		keepBlock := false
+		for _, line := range lines {
+			if bytes.HasPrefix(line, []byte("diff --git ")) {
+				inBlock = true
+				keepBlock = false
+				fields := strings.Fields(string(line))
+				if len(fields) >= 4 {
+					path := strings.TrimPrefix(fields[3], "b/")
+					keepBlock = matchesFile(path)
+				}
+			}
+			if inBlock && keepBlock {
+				kept.Write(line)
+			}
+		}
+		if kept.Len() > 0 {
+			out = append(out, kept.Bytes())
+		}
+	}
+	return out
 }
 
 func fuzzToReachPatched(config *api.FuzzConfig) time.Duration {

@@ -141,7 +141,7 @@ spec:
             arguments:
               parameters:
                 - name: config
-                  value: "{{=jsonpath(inputs.parameters.element, '$.fuzz')}}"
+                  value: "{{item}}"
                 - name: patched-build-id
                   value: "{{=jsonpath(steps['patched-build'].outputs.parameters.result, '$.build_id')}}"
                 - name: base-build-id
@@ -153,6 +153,9 @@ spec:
                   from: "{{steps.base-build.outputs.artifacts.kernel}}"
                 - name: patched-kernel
                   from: "{{steps.patched-build.outputs.artifacts.kernel}}"
+            withParam: "{{=jsonpath(inputs.parameters.element, '$.fuzz')}}"
+            continueOn:
+              failed: true
           - name: run-retest
             template: retest-campaign
             when: "{{=jsonpath(inputs.parameters.element, '$.retest') != nil}}"
@@ -201,7 +204,7 @@ spec:
                 - name: base-build-id
                   value: "{{inputs.parameters.base-build-id}}"
                 - name: test-name
-                  value: "[{{inputs.parameters.track}}] Fuzz"
+                  value: "[{{inputs.parameters.track}}] {{=jsonpath(inputs.parameters.config, '$.label') != '' ? jsonpath(inputs.parameters.config, '$.label') : 'Fuzz'}}"
               artifacts:
                 - name: base-kernel
                   from: "{{inputs.artifacts.base-kernel}}"

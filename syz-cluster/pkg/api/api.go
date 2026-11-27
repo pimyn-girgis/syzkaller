@@ -31,11 +31,11 @@ const (
 
 // TestTarget groups the testing tasks that share the same base/patched builds.
 type TestTarget struct {
-	Base    BuildRequest `json:"base"`
-	Patched BuildRequest `json:"patched"`
-	Track   string       `json:"track"` // E.g. KASAN.
-	Fuzz    *FuzzConfig  `json:"fuzz"`
-	Retest  *RetestTask  `json:"retest"`
+	Base    BuildRequest  `json:"base"`
+	Patched BuildRequest  `json:"patched"`
+	Track   string        `json:"track"` // E.g. KASAN.
+	Fuzz    []*FuzzConfig `json:"fuzz,omitempty"`
+	Retest  *RetestTask   `json:"retest"`
 }
 
 // RetestTask re(runs) the reproducers of the specified findings.
@@ -54,12 +54,18 @@ const (
 	FocusMM        = "mm"
 )
 
-const MaxRCFocusedPatches = 35
+const (
+	MaxRCFocusedPatches  = 35
+	StableRCFuzzDuration = "12h"
+)
 
 // FuzzConfig represents a set of parameters passed to the fuzz step.
 // The triage step aggregates multiple KernelFuzzConfig to construct FuzzConfig.
 type FuzzConfig struct {
-	Focus []string `json:"focus" yaml:"focus"`
+	Label             string   `json:"label,omitempty" yaml:"label,omitempty"`
+	Focus             []string `json:"focus" yaml:"focus"`
+	FocusPaths        []string `json:"focus_paths,omitempty" yaml:"focus_paths,omitempty"`
+	ExcludeFocusPaths []string `json:"exclude_focus_paths,omitempty" yaml:"exclude_focus_paths,omitempty"`
 	// TODO: this is temporarily here. We should do it at the beginning of the fuzzing step,
 	// where we do have the built binary and can extract exact symbol names / PC symbols.
 	FocusSymbols []string `json:"focus_symbols" yaml:"focus_symbols"`
@@ -68,6 +74,8 @@ type FuzzConfig struct {
 	SkipCoverCheck bool `json:"skip_cover_check" yaml:"skip_cover_check"`
 	// Only report the bugs that match the regexp.
 	BugTitleRe string `json:"bug_title_re" yaml:"bug_title_re"`
+	// Optional override for the fuzzing step duration (e.g. "12h" for LTS RCs).
+	FuzzTime   string `json:"fuzz_time,omitempty" yaml:"fuzz_time,omitempty"`
 	BaseCommit string `json:"base_commit,omitempty" yaml:"base_commit,omitempty"`
 	BaseTree   string `json:"base_tree,omitempty" yaml:"base_tree,omitempty"`
 }
@@ -91,12 +99,15 @@ type Tree struct {
 // KernelFuzzConfig is a specific fuzzing assignment.
 // Based on it, the triage step will construct FuzzTasks.
 type KernelFuzzConfig struct {
-	Track          string `json:"track" yaml:"track"` // E.g. KASAN.
-	KernelConfig   string `json:"kernel_config" yaml:"kernel_config"`
-	Focus          string `json:"focus" yaml:"focus"`
-	CorpusURL      string `json:"corpus_url" yaml:"corpus_url"`
-	SkipCoverCheck bool   `json:"skip_cover_check" yaml:"skip_cover_check"`
-	BugTitleRe     string `json:"bug_title_re" yaml:"bug_title_re"`
+	Track              string   `json:"track" yaml:"track"` // E.g. KASAN.
+	KernelConfig       string   `json:"kernel_config" yaml:"kernel_config"`
+	Focus              string   `json:"focus" yaml:"focus"`
+	Priority           bool     `json:"priority,omitempty" yaml:"priority,omitempty"`
+	PathRegexps        []string `json:"-" yaml:"-"`
+	ExcludePathRegexps []string `json:"-" yaml:"-"`
+	CorpusURL          string   `json:"corpus_url" yaml:"corpus_url"`
+	SkipCoverCheck     bool     `json:"skip_cover_check" yaml:"skip_cover_check"`
+	BugTitleRe         string   `json:"bug_title_re" yaml:"bug_title_re"`
 }
 
 // FuzzTriageTarget is a single record in the list of supported fuzz configs.
@@ -104,6 +115,7 @@ type FuzzTriageTarget struct {
 	PathRegexps        []string            `json:"path_regexps" yaml:"path_regexps"`
 	ExcludePathRegexps []string            `json:"exclude_path_regexps,omitempty" yaml:"exclude_path_regexps,omitempty"`
 	Focus              string              `json:"focus" yaml:"focus"`
+	Priority           bool                `json:"priority,omitempty" yaml:"priority,omitempty"`
 	CorpusURL          string              `json:"corpus_url" yaml:"corpus_url"`
 	Campaigns          []*KernelFuzzConfig `json:"campaigns" yaml:"campaigns"`
 }
