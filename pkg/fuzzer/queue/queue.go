@@ -115,10 +115,10 @@ func (r *Request) Risky() bool {
 
 func (r *Request) Validate() error {
 	collectSignal := r.ExecOpts.ExecFlags&flatrpc.ExecFlagCollectSignal > 0
-	if len(r.ReturnAllSignal) != 0 && !collectSignal {
-		return fmt.Errorf("ReturnAllSignal is set, but FlagCollectSignal is not")
-	}
 	collectComps := r.ExecOpts.ExecFlags&flatrpc.ExecFlagCollectComps > 0
+	if len(r.ReturnAllSignal) != 0 && !collectSignal && !collectComps {
+		return fmt.Errorf("ReturnAllSignal is set, but FlagCollectSignal/FlagCollectComps is not")
+	}
 	collectCover := r.ExecOpts.ExecFlags&flatrpc.ExecFlagCollectCover > 0
 	if (collectComps) && (collectSignal || collectCover) {
 		return fmt.Errorf("hint collection is mutually exclusive with signal/coverage")

@@ -447,6 +447,33 @@ func testCover(t *testing.T, target *prog.Target) {
 				0xc0000100, 0xc0001000, 0xc0002000},
 			Signal: []uint64{0xc0001100, 0xc0000140, 0xc0000011, 0xc0000001},
 		},
+		// Comparisons with cover filter (filtered unless ReturnAllSignal is set).
+		{
+			Is64Bit: true,
+			Input: makeComps(
+				Comparison{CmpSize8 | CmpConst, 0x1111, 0x2222, 0xc0dec0dec0000010},
+				Comparison{CmpSize8 | CmpConst, 0x3333, 0x4444, 0xc0dec0dec0000100},
+			),
+			CoverFilter: []uint64{0xc0dec0dec0000100},
+			Flags:       flatrpc.ExecFlagCollectComps,
+			Comps: []*flatrpc.Comparison{
+				{Pc: 0xc0dec0dec0000100, Op1: 0x4444, Op2: 0x3333, IsConst: true},
+			},
+		},
+		{
+			Is64Bit: true,
+			Input: makeComps(
+				Comparison{CmpSize8 | CmpConst, 0x1111, 0x2222, 0xc0dec0dec0000010},
+				Comparison{CmpSize8 | CmpConst, 0x3333, 0x4444, 0xc0dec0dec0000100},
+			),
+			CoverFilter:     []uint64{0xc0dec0dec0000100},
+			ReturnAllSignal: true,
+			Flags:           flatrpc.ExecFlagCollectComps,
+			Comps: []*flatrpc.Comparison{
+				{Pc: 0xc0dec0dec0000010, Op1: 0x2222, Op2: 0x1111, IsConst: true},
+				{Pc: 0xc0dec0dec0000100, Op1: 0x4444, Op2: 0x3333, IsConst: true},
+			},
+		},
 		// Extra coverage.
 		{
 			Is64Bit:       true,

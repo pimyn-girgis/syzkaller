@@ -54,10 +54,15 @@ func (ctx *checkContext) startFeaturesCheck() {
 		}
 		go func() {
 			envFlags, execFlags := ctx.featureToFlags(feat)
+			var returnAllSignal []int
+			if feat == flatrpc.FeatureComparisons {
+				returnAllSignal = []int{0}
+			}
 			req := &queue.Request{
-				Prog:         testProg,
-				ReturnOutput: true,
-				ReturnError:  true,
+				Prog:            testProg,
+				ReturnAllSignal: returnAllSignal,
+				ReturnOutput:    true,
+				ReturnError:     true,
 				ExecOpts: flatrpc.ExecOpts{
 					EnvFlags:   envFlags,
 					ExecFlags:  execFlags,

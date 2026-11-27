@@ -489,7 +489,7 @@ static void copyin(char* addr, uint64 val, uint64 size, uint64 bf, uint64 bf_off
 static bool copyout(char* addr, uint64 size, uint64* res);
 static void setup_control_pipes();
 static bool coverage_filter(uint64 pc);
-static rpc::ComparisonRaw convert(const kcov_comparison_t& cmp);
+static rpc::ComparisonRaw convert(const kcov_comparison_t& cmp, bool all_signal);
 static flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64 req_id, uint32 num_calls,
 						uint64 elapsed, uint64 freshness, uint32 status, bool hanged,
 						const std::vector<uint8_t>* process_output);
@@ -1308,7 +1308,7 @@ uint32 write_cover(flatbuffers::FlatBufferBuilder& fbb, cover_t* cov)
 	return fbb.EndVector(count);
 }
 
-uint32 write_comparisons(flatbuffers::FlatBufferBuilder& fbb, cover_t* cov)
+uint32 write_comparisons(flatbuffers::FlatBufferBuilder& fbb, cover_t* cov, bool all_signal)
 {
 	// Collect only the comparisons
 	uint64 ncomps = *(uint64_t*)cov->data;
@@ -1324,7 +1324,7 @@ uint32 write_comparisons(flatbuffers::FlatBufferBuilder& fbb, cover_t* cov)
 	uint32 deduped_count = 0;
 	const uint32 chunk = kDedupChunk<rpc::ComparisonRaw>;
 	for (uint32 i = 0; i < ncomps; i++) {
-		auto raw = convert(cov_start[i]);
+		auto raw = convert(cov_start[i], all_signal);
 		if (raw.pc()) {
 			fbb.PushBytes((const uint8_t*)&raw, sizeof(raw));
 			count++;
@@ -1425,7 +1425,7 @@ void write_output(int index, cover_t* cov, rpc::CallFlag flags, uint32 error, bo
 	uint32 cover_off = 0;
 	uint32 comps_off = 0;
 	if (flag_comparisons) {
-		comps_off = write_comparisons(fbb, cov);
+		comps_off = write_comparisons(fbb, cov, all_signal);
 	} else {
 		if (flag_collect_signal) {
 			if (is_kernel_64_bit)
@@ -1867,7 +1867,7 @@ uint64 read_input(uint8** input_posp, bool peek)
 	return v;
 }
 
-rpc::ComparisonRaw convert(const kcov_comparison_t& cmp)
+rpc::ComparisonRaw convert(const kcov_comparison_t& cmp, bool all_signal)
 {
 	if (cmp.type > (KCOV_CMP_CONST | KCOV_CMP_SIZE_MASK))
 		failmsg("invalid kcov comp type", "type=%llx", cmp.type);
@@ -1889,7 +1889,7 @@ rpc::ComparisonRaw convert(const kcov_comparison_t& cmp)
 		return {};
 	if (arg2 >= out_start && arg2 <= out_end)
 		return {};
-	if (!coverage_filter(cmp.pc))
+	if (!all_signal && !coverage_filter(cmp.pc))
 		return {};
 
 	// KCOV converts all arguments of size x first to uintx_t and then to uint64.
