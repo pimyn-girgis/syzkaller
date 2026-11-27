@@ -213,7 +213,13 @@ func (kc *kernelContext) setupFuzzer(features flatrpc.Feature, syscalls map[*pro
 	for i := range filtered {
 		filtered[i].Flags |= fuzzer.ProgSmashed
 	}
-	log.Logf(0, "%s: adding %d seeds", kc.name, len(filtered))
+	focused, deferred := prioritizeCandidates(kc.cfg, filtered)
+	if focused > 0 || deferred > 0 {
+		log.Logf(0, "%s: adding %d seeds (%d focused, %d deferred)",
+			kc.name, len(filtered), focused, deferred)
+	} else {
+		log.Logf(0, "%s: adding %d seeds", kc.name, len(filtered))
+	}
 	fuzzerObj.AddCandidates(filtered)
 
 	go func() {
@@ -243,11 +249,16 @@ func (kc *kernelContext) CoverageFilter(modules []*vminfo.KernelModule) ([]uint6
 		return nil, fmt.Errorf("failed to init coverage filter: %w", err)
 	}
 	kc.coverFilters = filters
+	areaLogLevel := 0
+	if len(filters.Areas) > 16 {
+		areaLogLevel = 1
+	}
 	for _, area := range filters.Areas {
-		log.Logf(0, "area %q: %d PCs in the cover filter",
+		log.Logf(areaLogLevel, "area %q: %d PCs in the cover filter",
 			area.Name, len(area.CoverPCs))
 	}
-	log.Logf(0, "executor cover filter: %d PCs", len(filters.ExecutorFilter))
+	log.Logf(0, "configured %d focus areas, executor cover filter: %d PCs",
+		len(filters.Areas), len(filters.ExecutorFilter))
 	if kc.http != nil {
 		kc.http.Cover.Store(&manager.CoverageInfo{
 			Modules:         modules,
@@ -265,9 +276,17 @@ func (kc *kernelContext) CoverageFilter(modules []*vminfo.KernelModule) ([]uint6
 func (kc *kernelContext) fuzzerInstance(ctx context.Context, inst *vm.Instance, updInfo dispatcher.UpdateInfo) {
 	reps, err := kc.serv.RunRequests(ctx, inst, kc.reporter, updInfo)
 	if len(reps) > 0 {
-		select {
-		case kc.crashes <- reps[0]:
-		case <-ctx.Done():
+		rep := reps[0]
+		if kc.reporter != nil {
+			if symErr := kc.reporter.Symbolize(rep); symErr != nil {
+				log.Errorf("failed to symbolize report: %v", symErr)
+			}
+		}
+		if !rep.Suppressed {
+			select {
+			case kc.crashes <- rep:
+			case <-ctx.Done():
+			}
 		}
 	}
 	if err != nil {

@@ -34,17 +34,20 @@ type Corpus struct {
 	StatCover  *stat.Val
 
 	focusAreas []*focusAreaState
+	pcToAreas  map[uint64][]*focusAreaState
 }
 
 type focusAreaState struct {
 	FocusArea
 	*ProgramsList
+	smashed int
 }
 
 type FocusArea struct {
-	Name     string // can be empty
-	CoverPCs map[uint64]struct{}
-	Weight   float64
+	Name           string // can be empty
+	CoverPCs       map[uint64]struct{}
+	Weight         float64
+	AdaptiveWeight bool
 }
 
 func (fa *FocusArea) inAreaPCs(cover []uint64) int {
@@ -78,21 +81,45 @@ func NewFocusedCorpus(ctx context.Context, updates chan<- NewItemEvent, areas []
 		stat.LenOf(&corpus.signal, &corpus.mu))
 	corpus.StatCover = stat.New("coverage", "Source coverage in the corpus", stat.Console,
 		stat.Link("/cover"), stat.Prometheus("syz_corpus_cover"), stat.LenOf(&corpus.cover, &corpus.mu))
+	const maxConsoleAreaStats = 16
 	for _, area := range areas {
 		obj := &ProgramsList{}
 		if len(area.CoverPCs) == 0 {
 			obj = corpus.ProgramsList
-		} else if len(areas) > 1 && area.Name != "" {
-			// Only show extra statistics if there's more than one area.
+		} else if len(areas) > 1 && len(areas) <= maxConsoleAreaStats && area.Name != "" {
+			// Only show individual statistics when there is a small number of areas.
 			stat.New("corpus ["+area.Name+"]",
 				fmt.Sprintf("Corpus programs of the focus area %q", area.Name),
 				stat.Console, stat.Graph("corpus"),
 				stat.LenOf(&obj.progs, &corpus.mu))
 		}
-		corpus.focusAreas = append(corpus.focusAreas, &focusAreaState{
+		state := &focusAreaState{
 			FocusArea:    area,
 			ProgramsList: obj,
-		})
+		}
+		corpus.focusAreas = append(corpus.focusAreas, state)
+		if len(area.CoverPCs) > 0 {
+			if corpus.pcToAreas == nil {
+				corpus.pcToAreas = make(map[uint64][]*focusAreaState)
+			}
+			for pc := range area.CoverPCs {
+				corpus.pcToAreas[pc] = append(corpus.pcToAreas[pc], state)
+			}
+		}
+	}
+	if len(areas) > maxConsoleAreaStats {
+		stat.New("focused areas", "Number of focus areas reached by corpus programs", stat.Console,
+			func() int {
+				corpus.mu.RLock()
+				defer corpus.mu.RUnlock()
+				reached := 0
+				for _, area := range corpus.focusAreas {
+					if len(area.CoverPCs) > 0 && area.Name != "" && len(area.progs) > 0 {
+						reached++
+					}
+				}
+				return reached
+			})
 	}
 	return corpus
 }
@@ -109,13 +136,14 @@ type ItemUpdate struct {
 // too hard to synchonize accesses to them across the whole project.
 // When Corpus updates one of its items, it saves a copy of it.
 type Item struct {
-	Sig     string
-	Call    int
-	Prog    *prog.Prog
-	HasAny  bool // whether the prog contains squashed arguments
-	Signal  signal.Signal
-	Cover   []uint64
-	Updates []ItemUpdate
+	Sig        string
+	Call       int
+	Prog       *prog.Prog
+	HasAny     bool // whether the prog contains squashed arguments
+	Signal     signal.Signal
+	Cover      []uint64
+	FocusCover []uint64
+	Updates    []ItemUpdate
 
 	areas map[*focusAreaState]struct{}
 }
@@ -124,12 +152,20 @@ func (item Item) StringCall() string {
 	return item.Prog.CallName(item.Call)
 }
 
+func (item Item) focusPCs() []uint64 {
+	if len(item.FocusCover) > 0 {
+		return item.FocusCover
+	}
+	return item.Cover
+}
+
 type NewInput struct {
-	Prog     *prog.Prog
-	Call     int
-	Signal   signal.Signal
-	Cover    []uint64
-	RawCover []uint64
+	Prog       *prog.Prog
+	Call       int
+	Signal     signal.Signal
+	Cover      []uint64
+	FocusCover []uint64
+	RawCover   []uint64
 }
 
 type NewItemEvent struct {
@@ -158,15 +194,24 @@ func (corpus *Corpus) Save(inp NewInput) {
 		var newCover cover.Cover
 		newCover.Merge(old.Cover)
 		newCover.Merge(inp.Cover)
+		var focusCover []uint64
+		if len(old.FocusCover) > 0 || len(inp.FocusCover) > 0 {
+			var fc cover.Cover
+			fc.Merge(old.FocusCover)
+			fc.Merge(inp.Cover)
+			fc.Merge(inp.FocusCover)
+			focusCover = fc.Serialize()
+		}
 		newItem := &Item{
-			Sig:     sig,
-			Prog:    old.Prog,
-			Call:    old.Call,
-			HasAny:  old.HasAny,
-			Signal:  newSignal,
-			Cover:   newCover.Serialize(),
-			Updates: slices.Clone(old.Updates),
-			areas:   maps.Clone(old.areas),
+			Sig:        sig,
+			Prog:       old.Prog,
+			Call:       old.Call,
+			HasAny:     old.HasAny,
+			Signal:     newSignal,
+			Cover:      newCover.Serialize(),
+			FocusCover: focusCover,
+			Updates:    slices.Clone(old.Updates),
+			areas:      maps.Clone(old.areas),
 		}
 		const maxUpdates = 32
 		if len(newItem.Updates) < maxUpdates {
@@ -175,14 +220,22 @@ func (corpus *Corpus) Save(inp NewInput) {
 		corpus.progsMap[sig] = newItem
 		corpus.applyFocusAreas(newItem)
 	} else {
+		var focusCover []uint64
+		if len(inp.FocusCover) > 0 {
+			var fc cover.Cover
+			fc.Merge(inp.Cover)
+			fc.Merge(inp.FocusCover)
+			focusCover = fc.Serialize()
+		}
 		item := &Item{
-			Sig:     sig,
-			Call:    inp.Call,
-			Prog:    inp.Prog,
-			HasAny:  inp.Prog.ContainsAny(),
-			Signal:  inp.Signal,
-			Cover:   inp.Cover,
-			Updates: []ItemUpdate{update},
+			Sig:        sig,
+			Call:       inp.Call,
+			Prog:       inp.Prog,
+			HasAny:     inp.Prog.ContainsAny(),
+			Signal:     inp.Signal,
+			Cover:      inp.Cover,
+			FocusCover: focusCover,
+			Updates:    []ItemUpdate{update},
 		}
 		corpus.progsMap[sig] = item
 		corpus.applyFocusAreas(item)
@@ -204,15 +257,26 @@ func (corpus *Corpus) Save(inp NewInput) {
 }
 
 func (corpus *Corpus) applyFocusAreas(item *Item) {
+	if len(corpus.pcToAreas) == 0 {
+		return
+	}
+	var hits map[*focusAreaState]int
+	for _, pc := range item.focusPCs() {
+		for _, area := range corpus.pcToAreas[pc] {
+			if _, ok := item.areas[area]; ok {
+				continue
+			}
+			if hits == nil {
+				hits = make(map[*focusAreaState]int)
+			}
+			hits[area]++
+		}
+	}
+	if len(hits) == 0 {
+		return
+	}
 	for _, area := range corpus.focusAreas {
-		if len(area.CoverPCs) == 0 {
-			// Already handled via corpus.ProgramsList.
-			continue
-		}
-		if _, ok := item.areas[area]; ok {
-			continue
-		}
-		prio := area.inAreaPCs(item.Cover)
+		prio := hits[area]
 		if prio == 0 {
 			continue
 		}
@@ -222,6 +286,46 @@ func (corpus *Corpus) applyFocusAreas(item *Item) {
 		}
 		item.areas[area] = struct{}{}
 	}
+}
+
+const minFocusSmashWeight = 4.0
+
+// ClaimFocusSmash checks whether coverPCs hit any high-priority focus area that has
+// fewer than maxPerArea smashed inputs so far, claiming a smash slot on matched areas.
+func (corpus *Corpus) ClaimFocusSmash(coverPCs []uint64, maxPerArea int) (bool, []*prog.Prog) {
+	if maxPerArea <= 0 {
+		return false, nil
+	}
+	corpus.mu.Lock()
+	defer corpus.mu.Unlock()
+	if len(corpus.pcToAreas) == 0 {
+		return false, nil
+	}
+	var matched []*focusAreaState
+	seen := make(map[*focusAreaState]struct{})
+	for _, pc := range coverPCs {
+		for _, area := range corpus.pcToAreas[pc] {
+			if area.Weight < minFocusSmashWeight || area.smashed >= maxPerArea {
+				continue
+			}
+			if _, ok := seen[area]; ok {
+				continue
+			}
+			seen[area] = struct{}{}
+			matched = append(matched, area)
+		}
+	}
+	if len(matched) == 0 {
+		return false, nil
+	}
+	var bestPool []*prog.Prog
+	for _, area := range matched {
+		area.smashed++
+		if len(area.progs) > len(bestPool) {
+			bestPool = area.progs
+		}
+	}
+	return true, bestPool
 }
 
 func (corpus *Corpus) Signal() signal.Signal {

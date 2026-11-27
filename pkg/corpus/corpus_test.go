@@ -234,3 +234,37 @@ func TestCallCoverPreserved(t *testing.T) {
 	callCover := corpus.CallCover()
 	require.Equal(t, cover.FromRaw([]uint64{10, 30}), callCover[prog.ExtraCallName].Cover)
 }
+
+func TestFocusedCorpusFocusCoverAndSummaryStat(t *testing.T) {
+	target := getTarget(t, targets.TestOS, targets.TestArch64)
+	rs := rand.NewSource(0)
+
+	var areas []FocusArea
+	for i := range 20 {
+		areas = append(areas, FocusArea{
+			Name:     "shard",
+			CoverPCs: map[uint64]struct{}{uint64(100 + i): {}},
+			Weight:   8.0,
+		})
+	}
+	corpus := NewFocusedCorpus(context.Background(), nil, areas)
+
+	// Input whose triaged call only covers PC 1, while an earlier setup call in FocusCover covers PCs 100 and 105.
+	inp := generateRangedInput(target, rs, 1, 1)
+	inp.Cover = []uint64{1}
+	inp.FocusCover = []uint64{100, 105}
+	corpus.Save(inp)
+
+	assert.Len(t, corpus.focusAreas[0].progs, 1)
+	assert.Len(t, corpus.focusAreas[5].progs, 1)
+	assert.Empty(t, corpus.focusAreas[1].progs)
+
+	foundSummary := false
+	for _, ui := range stat.Collect(stat.All) {
+		if ui.Name == "focused areas" {
+			foundSummary = true
+			assert.GreaterOrEqual(t, ui.V, 2)
+		}
+	}
+	assert.True(t, foundSummary, "expected 'focused areas' summary stat when >16 focus areas exist")
+}

@@ -62,7 +62,7 @@ func genProgRequest(fuzzer *Fuzzer, rnd *rand.Rand) *queue.Request {
 }
 
 func mutateProgRequest(fuzzer *Fuzzer, rnd *rand.Rand) *queue.Request {
-	p := fuzzer.Config.Corpus.ChooseProgram(rnd)
+	p, splice := fuzzer.Config.Corpus.ChooseProgramWithSplice(rnd)
 	if p == nil {
 		return nil
 	}
@@ -71,7 +71,7 @@ func mutateProgRequest(fuzzer *Fuzzer, rnd *rand.Rand) *queue.Request {
 		prog.RecommendedCalls,
 		fuzzer.ChoiceTable(),
 		fuzzer.Config.NoMutateCalls,
-		fuzzer.Config.Corpus.Programs(),
+		splice,
 	)
 	return &queue.Request{
 		Prog:     newP,
@@ -85,11 +85,12 @@ func mutateProgRequest(fuzzer *Fuzzer, rnd *rand.Rand) *queue.Request {
 // During triage we understand if these programs in fact give new coverage,
 // and if yes, minimize them and add to corpus.
 type triageJob struct {
-	p        *prog.Prog
-	executor queue.ExecutorID
-	flags    ProgFlags
-	fuzzer   *Fuzzer
-	queue    queue.Executor
+	p         *prog.Prog
+	executor  queue.ExecutorID
+	flags     ProgFlags
+	fuzzer    *Fuzzer
+	queue     queue.Executor
+	progCover cover.Cover
 	// Set of calls that gave potential new coverage.
 	calls map[int]*triageCall
 
@@ -184,10 +185,39 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 	if !job.fuzzer.Config.NewInputFilter(callName) {
 		return
 	}
-	if job.flags&ProgSmashed == 0 {
+	callCover := info.cover.Serialize()
+	var focusCover []uint64
+	if job.flags&ProgMinimized != 0 || len(p.Calls) == len(job.p.Calls) {
+		focusCover = job.progCover.Serialize()
+	}
+	const (
+		maxFocusSmashPerArea = 2
+		maxPatchSmashJobs    = 64
+		maxPatchFocusSmash   = 32
+		maxPatchHintsJobs    = 16
+	)
+	startSmash := job.flags&ProgSmashed == 0 &&
+		(!job.fuzzer.Config.PatchTest || job.fuzzer.statJobsSmash.Val() < maxPatchSmashJobs)
+	var smashSplice []*prog.Prog
+	if job.flags&ProgSmashed != 0 && job.fuzzer.Config.PatchTest &&
+		job.fuzzer.Config.Corpus != nil && job.fuzzer.statJobsSmash.Val() < maxPatchFocusSmash {
+		startSmash, smashSplice = job.fuzzer.Config.Corpus.ClaimFocusSmash(callCover, maxFocusSmashPerArea)
+	}
+	job.fuzzer.Logf(2, "added new input for %v to the corpus: %s", callName, p)
+	input := corpus.NewInput{
+		Prog:       p,
+		Call:       call,
+		Signal:     info.stableSignal,
+		Cover:      callCover,
+		FocusCover: focusCover,
+		RawCover:   info.rawCover,
+	}
+	job.fuzzer.Config.Corpus.Save(input)
+	if startSmash {
 		job.fuzzer.startJob(job.fuzzer.statJobsSmash, &smashJob{
-			exec: job.fuzzer.smashQueue,
-			p:    p.Clone(),
+			exec:   job.fuzzer.smashQueue,
+			p:      p.Clone(),
+			splice: smashSplice,
 			info: &JobInfo{
 				Name:  p.String(),
 				Type:  JobSmash,
@@ -195,7 +225,8 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 			},
 		})
 		if job.fuzzer.Config.Comparisons && call >= 0 &&
-			!job.fuzzer.Config.NoMutateCalls[p.Calls[call].Meta.ID] {
+			!job.fuzzer.Config.NoMutateCalls[p.Calls[call].Meta.ID] &&
+			(!job.fuzzer.Config.PatchTest || job.fuzzer.statJobsHints.Val() < maxPatchHintsJobs) {
 			job.fuzzer.startJob(job.fuzzer.statJobsHints, &hintsJob{
 				exec: job.fuzzer.smashQueue,
 				p:    p.Clone(),
@@ -207,7 +238,7 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 				},
 			})
 		}
-		if job.fuzzer.Config.FaultInjection && call >= 0 {
+		if job.flags&ProgSmashed == 0 && job.fuzzer.Config.FaultInjection && call >= 0 {
 			job.fuzzer.startJob(job.fuzzer.statJobsFaultInjection, &faultInjectionJob{
 				exec: job.fuzzer.smashQueue,
 				p:    p.Clone(),
@@ -215,15 +246,6 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 			})
 		}
 	}
-	job.fuzzer.Logf(2, "added new input for %v to the corpus: %s", callName, p)
-	input := corpus.NewInput{
-		Prog:     p,
-		Call:     call,
-		Signal:   info.stableSignal,
-		Cover:    info.cover.Serialize(),
-		RawCover: info.rawCover,
-	}
-	job.fuzzer.Config.Corpus.Save(input)
 }
 
 func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result) (stop bool) {
@@ -293,6 +315,9 @@ func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result
 			info.signals[0].Merge(thisSignal)
 		}
 		for i, callInfo := range result.Info.Calls {
+			if callInfo != nil {
+				job.progCover.Merge(callInfo.Cover)
+			}
 			deflakeCall(i, callInfo)
 		}
 		deflakeCall(-1, result.Info.Extra)
@@ -447,9 +472,10 @@ func (job *triageJob) getInfo() *JobInfo {
 }
 
 type smashJob struct {
-	exec queue.Executor
-	p    *prog.Prog
-	info *JobInfo
+	exec   queue.Executor
+	p      *prog.Prog
+	splice []*prog.Prog
+	info   *JobInfo
 }
 
 func (job *smashJob) run(fuzzer *Fuzzer) {
@@ -460,10 +486,14 @@ func (job *smashJob) run(fuzzer *Fuzzer) {
 	rnd := fuzzer.rand()
 	for range iters {
 		p := job.p.Clone()
+		splice := fuzzer.Config.Corpus.Programs()
+		if len(job.splice) >= 2 && rnd.Intn(5) != 0 {
+			splice = job.splice
+		}
 		p.Mutate(rnd, prog.RecommendedCalls,
 			fuzzer.ChoiceTable(),
 			fuzzer.Config.NoMutateCalls,
-			fuzzer.Config.Corpus.Programs())
+			splice)
 		result := fuzzer.execute(job.exec, &queue.Request{
 			Prog:     p,
 			ExecOpts: setFlags(flatrpc.ExecFlagCollectSignal),

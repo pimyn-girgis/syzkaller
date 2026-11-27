@@ -22,10 +22,12 @@ import (
 	"github.com/google/syzkaller/pkg/execbackend"
 	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/fuzzer/queue"
+	"github.com/google/syzkaller/pkg/signal"
 	"github.com/google/syzkaller/pkg/testutil"
 	"github.com/google/syzkaller/prog"
 	"github.com/google/syzkaller/sys/targets"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestFuzz(t *testing.T) {
@@ -249,4 +251,64 @@ func checkGoroutineLeaks() {
 	if err != "" {
 		panic(err)
 	}
+}
+
+func TestPatchTestCandidateInterleaving(t *testing.T) {
+	t.Cleanup(checkGoroutineLeaks)
+
+	target, err := prog.GetTarget(targets.TestOS, targets.TestArch64)
+	require.NoError(t, err)
+
+	ctx := t.Context()
+
+	enabled := map[*prog.Syscall]bool{
+		target.SyscallMap["test$manual"]: true,
+	}
+	corp := corpus.NewCorpus(ctx)
+	f := NewFuzzer(ctx, &Config{
+		Corpus:       corp,
+		Coverage:     true,
+		PatchTest:    true,
+		EnabledCalls: enabled,
+	}, rand.New(rand.NewSource(1)), target)
+
+	ct := target.BuildChoiceTable(nil, enabled)
+	rs := rand.NewSource(2)
+	var cands []Candidate
+	for range 500 {
+		cands = append(cands, Candidate{
+			Prog:  target.Generate(rs, 2, ct),
+			Flags: ProgFromCorpus | ProgMinimized | ProgSmashed,
+		})
+	}
+	f.AddCandidates(cands)
+
+	// While corpus has <16 inputs, all requests should pull from candidateQueue.
+	for range 20 {
+		req := f.Next()
+		assert.Equal(t, f.statExecCandidate, req.Stat)
+	}
+
+	// Populate corpus past the steady-state threshold; candidateQueue must interleave with fuzzing.
+	for i := range 300 {
+		p := target.Generate(rs, 2, ct)
+		corp.Save(corpus.NewInput{
+			Prog:   p,
+			Call:   0,
+			Signal: signal.FromRaw([]uint64{uint64(i + 1)}, 0),
+			Cover:  []uint64{uint64(i + 1)},
+		})
+	}
+
+	candReqs, otherReqs := 0, 0
+	for range 200 {
+		req := f.Next()
+		if req.Stat == f.statExecCandidate {
+			candReqs++
+		} else {
+			otherReqs++
+		}
+	}
+	assert.Greater(t, candReqs, 60)
+	assert.Greater(t, otherReqs, 60)
 }

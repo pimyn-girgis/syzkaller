@@ -331,7 +331,8 @@ func (cfg *Config) completeHTTPPublicURL() error {
 }
 
 func (cov *CovFilterCfg) Empty() bool {
-	return len(cov.Functions)+len(cov.Files)+len(cov.RawPCs) == 0
+	return len(cov.Functions)+len(cov.Files)+len(cov.RawPCs)+len(cov.HeaderFunctions) == 0 &&
+		cov.Unit == "" && !cov.IncludeHeaderInlines
 }
 
 func (cfg *Config) CompleteKernelDirs() {

@@ -359,7 +359,7 @@ func (dc *diffContext) monitorPatchedCoverage(ctx context.Context) error {
 	focusPCs := 0
 	focusAreas := map[string]struct{}{}
 	for _, area := range dc.new.CoverFilters().Areas {
-		if area.Name == "" {
+		if area.Name == "" || area.Name == subsystemContextArea {
 			continue
 		}
 		focusAreas[area.Name] = struct{}{}

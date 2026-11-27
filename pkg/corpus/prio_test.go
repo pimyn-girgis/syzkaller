@@ -155,3 +155,94 @@ func TestFocusAreaInAreaWeighting(t *testing.T) {
 	corpus.Minimize(true)
 	verifySampling("after minimization")
 }
+
+func TestAdaptiveWeightAndAreaSplice(t *testing.T) {
+	target := getTarget(t, targets.TestOS, targets.TestArch64)
+	rs := rand.NewSource(42)
+	rnd := rand.New(rs)
+
+	corpus := NewFocusedCorpus(context.Background(), nil, []FocusArea{
+		{
+			Name:           "flooded_area",
+			CoverPCs:       map[uint64]struct{}{10: {}},
+			Weight:         8.0,
+			AdaptiveWeight: true,
+		},
+		{
+			Name:           "rare_area",
+			CoverPCs:       map[uint64]struct{}{20: {}},
+			Weight:         8.0,
+			AdaptiveWeight: true,
+		},
+	})
+
+	floodedProgs := make(map[*prog.Prog]bool)
+	for i := range 100 {
+		inp := generateRangedInput(target, rs, i+1, i+1)
+		inp.Cover = []uint64{10}
+		floodedProgs[inp.Prog] = true
+		corpus.Save(inp)
+	}
+	rareInputs := make(map[*prog.Prog]bool)
+	for i := range 2 {
+		inp := generateRangedInput(target, rs, 500+i, 500+i)
+		inp.Cover = []uint64{20}
+		rareInputs[inp.Prog] = true
+		corpus.Save(inp)
+	}
+
+	rareCount := 0
+	areaSpliceHits := 0
+	const iters = 5000
+	for range iters {
+		p, splicePool := corpus.ChooseProgramWithSplice(rnd)
+		if rareInputs[p] {
+			rareCount++
+			if len(splicePool) == 2 {
+				areaSpliceHits++
+			}
+		}
+	}
+	// With AdaptiveWeight: rare_area (N=2, <=4 boost) gets weight 8*2/sqrt(2) = 11.31
+	// vs flooded_area (N=100) 8/sqrt(100) = 0.8.
+	// So rare_area should be selected >85% of the time despite having 50x fewer programs!
+	assert.Greater(t, float64(rareCount)/iters, 0.85)
+	assert.Greater(t, float64(areaSpliceHits)/float64(rareCount), 0.70)
+}
+
+func TestClaimFocusSmash(t *testing.T) {
+	target := getTarget(t, targets.TestOS, targets.TestArch64)
+	rs := rand.NewSource(1)
+
+	corpus := NewFocusedCorpus(context.Background(), nil, []FocusArea{
+		{
+			Name:     "high_prio_patch",
+			CoverPCs: map[uint64]struct{}{100: {}},
+			Weight:   8.0,
+		},
+		{
+			Name:     "low_prio_bg",
+			CoverPCs: map[uint64]struct{}{200: {}},
+			Weight:   1.5,
+		},
+	})
+
+	inp := generateRangedInput(target, rs, 1, 1)
+	inp.Cover = []uint64{100}
+	corpus.Save(inp)
+
+	ok, pool := corpus.ClaimFocusSmash([]uint64{200}, 2)
+	assert.False(t, ok)
+	assert.Empty(t, pool)
+
+	ok, pool = corpus.ClaimFocusSmash([]uint64{100}, 2)
+	assert.True(t, ok)
+	assert.Len(t, pool, 1)
+
+	ok, _ = corpus.ClaimFocusSmash([]uint64{100}, 2)
+	assert.True(t, ok)
+
+	// Third claim exceeds maxPerArea=2.
+	ok, _ = corpus.ClaimFocusSmash([]uint64{100}, 2)
+	assert.False(t, ok)
+}

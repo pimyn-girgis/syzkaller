@@ -246,6 +246,12 @@ func TestMonitorPatchedCoverage(t *testing.T) {
 			progs:   map[string]int{"": 10},
 			wantErr: ErrPatchedAreaNotReached,
 		},
+		{
+			name:    "only subsystem_context reached",
+			areas:   []corpus.FocusArea{area("arch/x86/kvm/x86.c", 1), area(subsystemContextArea, 2)},
+			progs:   map[string]int{subsystemContextArea: 15},
+			wantErr: ErrPatchedAreaNotReached,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

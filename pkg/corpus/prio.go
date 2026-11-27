@@ -4,6 +4,7 @@
 package corpus
 
 import (
+	"math"
 	"math/rand"
 	"sort"
 
@@ -36,38 +37,61 @@ func (pl *ProgramsList) saveProgram(p *prog.Prog, prio int) {
 	pl.progs = append(pl.progs, p)
 }
 
+func (fa *focusAreaState) effectiveWeight() float64 {
+	if !fa.AdaptiveWeight || len(fa.progs) == 0 {
+		return fa.Weight
+	}
+	w := fa.Weight / math.Sqrt(float64(len(fa.progs)))
+	if len(fa.progs) <= 4 {
+		w *= 2.0
+	}
+	return w
+}
+
 func (corpus *Corpus) ChooseProgram(r *rand.Rand) *prog.Prog {
+	p, _ := corpus.ChooseProgramWithSplice(r)
+	return p
+}
+
+// ChooseProgramWithSplice picks a corpus program according to focus area weights and returns
+// both the chosen program and a pool of programs suitable for splice mutations.
+func (corpus *Corpus) ChooseProgramWithSplice(r *rand.Rand) (*prog.Prog, []*prog.Prog) {
 	corpus.mu.RLock()
 	defer corpus.mu.RUnlock()
 	if len(corpus.progsMap) == 0 {
-		return nil
+		return nil, nil
 	}
-	// We could have used an approach similar to chooseProgram(), but for small number
-	// of focus areas that is an overkill.
 	var randArea *focusAreaState
 	if len(corpus.focusAreas) > 0 {
 		sum := 0.0
 		nonEmpty := make([]*focusAreaState, 0, len(corpus.focusAreas))
+		weights := make([]float64, 0, len(corpus.focusAreas))
 		for _, area := range corpus.focusAreas {
 			if len(area.progs) == 0 {
 				continue
 			}
-			sum += area.Weight
+			w := area.effectiveWeight()
+			sum += w
 			nonEmpty = append(nonEmpty, area)
+			weights = append(weights, w)
 		}
 		val := r.Float64() * sum
 		currSum := 0.0
-		for _, area := range nonEmpty {
+		for i, area := range nonEmpty {
 			if val >= currSum {
 				randArea = area
 			}
-			currSum += area.Weight
+			currSum += weights[i]
 		}
 	}
 	if randArea != nil {
-		return randArea.chooseProgram(r)
+		p := randArea.chooseProgram(r)
+		if len(randArea.CoverPCs) > 0 && len(randArea.progs) >= 2 && r.Intn(5) != 0 {
+			return p, randArea.progs
+		}
+		return p, corpus.progs
 	}
-	return corpus.chooseProgram(r)
+	return corpus.chooseProgram(r), corpus.progs
 }
 
 func (corpus *Corpus) Programs() []*prog.Prog {

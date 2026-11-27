@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pkgfeatures "github.com/google/syzkaller/pkg/vminfo/features"
@@ -98,21 +99,52 @@ func newExecQueues(fuzzer *Fuzzer) execQueues {
 	}
 	// Alternate smash jobs with exec/fuzz to spread attention to the wider area.
 	skipQueue := 3
+	candSource := queue.Source(ret.candidateQueue)
 	if fuzzer.Config.PatchTest {
 		// When we do patch fuzzing, we do not focus on finding and persisting
 		// new coverage that much, so it's reasonable to spend more time just
 		// mutating various corpus programs.
 		skipQueue = 2
+		if fuzzer.Config.Corpus != nil {
+			candSource = &patchCandidateSource{
+				base:   ret.candidateQueue,
+				corpus: fuzzer.Config.Corpus,
+			}
+		}
 	}
 	// Sources are listed in the order, in which they will be polled.
 	ret.source = queue.Order(
 		ret.triageCandidateQueue,
-		ret.candidateQueue,
+		candSource,
 		ret.triageQueue,
 		queue.Alternate(ret.smashQueue, skipQueue),
 		queue.Callback(fuzzer.genFuzz),
 	)
 	return ret
+}
+
+type patchCandidateSource struct {
+	base   queue.Source
+	corpus *corpus.Corpus
+	seq    atomic.Uint64
+}
+
+func (s *patchCandidateSource) Next() *queue.Request {
+	progs := len(s.corpus.Programs())
+	const (
+		warmupCorpusSize = 16
+		steadyCorpusSize = 64
+	)
+	if progs >= steadyCorpusSize {
+		if s.seq.Add(1)%5 >= 3 {
+			return nil
+		}
+	} else if progs >= warmupCorpusSize {
+		if s.seq.Add(1)%4 == 0 {
+			return nil
+		}
+	}
+	return s.base.Next()
 }
 
 func (fuzzer *Fuzzer) CandidatesToTriage() int {

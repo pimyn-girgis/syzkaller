@@ -274,6 +274,16 @@ type Experimental struct {
 	// E.g. "focus_areas": [ {"filter": {"files": ["^net"]}, "weight": 10.0}, {"weight": 1.0} ].
 	FocusAreas []FocusArea `json:"focus_areas,omitempty"`
 
+	// ModifiedFiles lists kernel source files modified by a patch series during differential fuzzing.
+	ModifiedFiles []string `json:"modified_files,omitempty"`
+
+	// ModifiedSymbols lists ELF text symbols whose binary hash changed between base and patched builds.
+	ModifiedSymbols []string `json:"modified_symbols,omitempty"`
+
+	// FocusPaths optionally restricts patch focus areas and candidate prioritization to modified
+	// files matching at least one regexp (used for subsystem-focused campaigns on large series).
+	FocusPaths []string `json:"focus_paths,omitempty"`
+
 	// Enable dynamic discovery and fuzzing of KFuzzTest targets.
 	EnableKFuzzTest bool `json:"enable_kfuzztest"`
 }
@@ -296,6 +306,10 @@ type FocusArea struct {
 
 	// Weight is a positive number that determines how much focus should be put on this area.
 	Weight float64 `json:"weight"`
+
+	// AdaptiveWeight scales down the effective weight of this area as more programs accumulate
+	// in it, preventing broad files from starving newly reached or rare focus areas.
+	AdaptiveWeight bool `json:"adaptive_weight,omitempty"`
 }
 
 type Subsystem struct {
@@ -304,7 +318,10 @@ type Subsystem struct {
 }
 
 type CovFilterCfg struct {
-	Files     []string `json:"files,omitempty"`
-	Functions []string `json:"functions,omitempty"`
-	RawPCs    []string `json:"pcs,omitempty"`
+	Files                []string `json:"files,omitempty"`
+	Functions            []string `json:"functions,omitempty"`
+	RawPCs               []string `json:"pcs,omitempty"`
+	Unit                 string   `json:"unit,omitempty"`
+	HeaderFunctions      []string `json:"header_functions,omitempty"`
+	IncludeHeaderInlines bool     `json:"include_header_inlines,omitempty"`
 }
